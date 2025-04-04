@@ -1,0 +1,17 @@
+torch
+triton
+unsloth
+bitsandbytes
+peft
+transformers
+matplotlib
+numpy
+sentencepiece
+datasets
+protobuf
+fsspec
+huggingface_hub
+accelerate
+xformers
+trl
+hf_transfer
