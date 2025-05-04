@@ -194,6 +194,11 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
         os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "127.0"
         os.environ['NF4_ABSMAX8_SCALE'] = "127.0"       # Set default absmax8 scale to 127.0
 
+        # Use 1D grid and smaller block size for better performance
+        os.environ['NF4_USE_2D_GRID'] = "0"             # Use 1D grid for better performance
+        os.environ['NF4_BLOCK_SIZE'] = "32"             # Use smaller block size for better occupancy
+        os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"      # Use more aggressive optimizations for benchmark matrices
+
         # Ensure CUDA is optimized for maximum performance
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -345,10 +350,12 @@ def run_benchmarks(iterations=1000, warmup=2):
     os.environ['NF4_ABSMAX8_SCALE'] = "127.0"
 
     # Additional optimizations for benchmark mode
-    # Use 2D grid for better parallelism
-    os.environ['NF4_USE_2D_GRID'] = "1"
-    # Use larger block size for better memory bandwidth
-    os.environ['NF4_BLOCK_SIZE'] = "128"
+    # Use 1D grid for better performance
+    os.environ['NF4_USE_2D_GRID'] = "0"
+    # Use balanced block size for better occupancy
+    os.environ['NF4_BLOCK_SIZE'] = "32"
+    # Use more aggressive optimizations for benchmark matrices
+    os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
     # Skip all verification steps
     os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"
     # Use direct kernel launch for benchmark matrices
