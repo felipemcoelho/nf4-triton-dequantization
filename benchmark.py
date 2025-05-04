@@ -199,9 +199,9 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
         os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "127.0"
         os.environ['NF4_ABSMAX8_SCALE'] = "127.0"       # Set default absmax8 scale to 127.0
 
-        # Use 1D grid and ultra-small block size for maximum parallelism
-        os.environ['NF4_USE_2D_GRID'] = "0"             # Use 1D grid for better performance
-        os.environ['NF4_BLOCK_SIZE'] = "16"             # Use ultra-small block size for maximum parallelism
+        # Use 2D grid and larger block size for better memory bandwidth
+        os.environ['NF4_USE_2D_GRID'] = "1"             # Use 2D grid for better parallelism
+        os.environ['NF4_BLOCK_SIZE'] = "64"             # Use larger block size for better memory bandwidth
         os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"      # Use more aggressive optimizations for benchmark matrices
 
         # Ensure CUDA is optimized for maximum performance
@@ -270,10 +270,10 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
             os.environ['NF4_FORCE_FAST_KERNEL'] = "1"
             # Skip all verification for maximum performance
             os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"
-            # Use ultra-small block size for maximum parallelism
-            os.environ['NF4_BLOCK_SIZE'] = "16"
-            # Use 1D grid for better performance
-            os.environ['NF4_USE_2D_GRID'] = "0"
+            # Use larger block size for better memory bandwidth
+            os.environ['NF4_BLOCK_SIZE'] = "64"
+            # Use 2D grid for better parallelism
+            os.environ['NF4_USE_2D_GRID'] = "1"
             # Use more aggressive optimizations for benchmark matrices
             os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
             # Use direct kernel launch for benchmark matrices
@@ -286,17 +286,8 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
             torch.backends.cudnn.deterministic = False
             torch.backends.cuda.matmul.allow_tf32 = True
 
-            # Set GPU to maximum performance mode
-            # This is vendor-specific, but we can try to set common parameters
-            try:
-                # Try to set GPU to maximum performance mode
-                # This works on some NVIDIA GPUs
-                import subprocess
-                subprocess.run(["nvidia-smi", "-pm", "1"], check=False)
-                subprocess.run(["nvidia-smi", "-ac", "memory,maximum"], check=False)
-            except:
-                # Ignore errors if nvidia-smi is not available
-                pass
+            # Skip setting GPU performance mode as it requires root permissions
+            # This avoids permission errors in environments where we don't have admin rights
 
             # Create highest-priority stream for benchmarking
             stream = torch.cuda.Stream(priority=-1)
@@ -384,10 +375,10 @@ def run_benchmarks(iterations=1000, warmup=2):
     os.environ['NF4_ABSMAX8_SCALE'] = "127.0"
 
     # Additional optimizations for benchmark mode
-    # Use 1D grid for better performance
-    os.environ['NF4_USE_2D_GRID'] = "0"
-    # Use ultra-small block size for maximum parallelism
-    os.environ['NF4_BLOCK_SIZE'] = "16"
+    # Use 2D grid for better parallelism
+    os.environ['NF4_USE_2D_GRID'] = "1"
+    # Use larger block size for better memory bandwidth
+    os.environ['NF4_BLOCK_SIZE'] = "64"
     # Use more aggressive optimizations for benchmark matrices
     os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
     # Force using the fast kernel for all matrices

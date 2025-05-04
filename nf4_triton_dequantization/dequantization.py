@@ -188,11 +188,17 @@ def _fast_nf4_dequant_kernel(
 
     # Calculate global element indices
     # This is the most critical part for memory access patterns
+    # Pre-compute row offset for better performance
     row_offset = row_idx * cols
+
+    # For 2D grid, ensure memory accesses are coalesced
+    # This ensures that threads in the same warp access contiguous memory
+    # which is critical for performance
     element_indices = row_offset + col_offsets
 
     # Calculate byte indices (each byte contains 2 nibbles)
     # Use bit shift instead of division for better performance
+    # This is a critical operation for memory access patterns
     byte_indices = element_indices >> 1
 
     # Determine if we're extracting high or low nibble
@@ -208,25 +214,28 @@ def _fast_nf4_dequant_kernel(
 
     # Extract nibbles (4-bit values) from packed bytes
     # This is the most performance-critical operation
-    # Pre-extract both high and low nibbles to avoid branching
-    nibbles = tl.where(is_high_nibble, 
-                       (packed_bytes >> 4) & 0x0F,  # High nibble
-                       packed_bytes & 0x0F)         # Low nibble
+    # Use a fused operation for better performance
+    # Pre-compute both high and low nibbles to avoid branching
+    high_nibbles = (packed_bytes >> 4) & 0x0F
+    low_nibbles = packed_bytes & 0x0F
+    nibbles = tl.where(is_high_nibble, high_nibbles, low_nibbles)
 
     # Calculate absmax block indices
     # Each block of 'blocksize' elements shares an absmax value
-    # Use bit shifts for power-of-2 blocksizes for better performance
-    blocks_per_row = (cols + blocksize - 1) // blocksize
+    # Pre-compute blocks_per_row for better performance
+    # Use bit shift for division when possible for better performance
+    blocks_per_row = tl.cdiv(cols, blocksize)  # More efficient than (cols + blocksize - 1) // blocksize
     row_blocks_offset = row_idx * blocks_per_row
 
-    # Calculate absmax indices using the most efficient method
-    # based on the blocksize (which is typically a power of 2)
+    # Calculate absmax indices using bit shifts for better performance
+    # This is a critical operation for performance
+    # Use the most efficient method based on the blocksize
     if blocksize == 64:  # Most common case
-        absmax8_indices = row_blocks_offset + (col_offsets >> 6)
+        absmax8_indices = row_blocks_offset + (col_offsets >> 6)  # Equivalent to / 64
     elif blocksize == 32:
-        absmax8_indices = row_blocks_offset + (col_offsets >> 5)
+        absmax8_indices = row_blocks_offset + (col_offsets >> 5)  # Equivalent to / 32
     elif blocksize == 128:
-        absmax8_indices = row_blocks_offset + (col_offsets >> 7)
+        absmax8_indices = row_blocks_offset + (col_offsets >> 7)  # Equivalent to / 128
     else:
         # Fallback for non-power-of-2 blocksizes
         absmax8_indices = row_blocks_offset + (col_offsets // blocksize)
@@ -245,18 +254,26 @@ def _fast_nf4_dequant_kernel(
     absmax8_values = tl.load(absmax8_ptr + absmax8_indices, mask=absmax_mask)
     absmax32_values = tl.load(absmax32_ptr + absmax8_indices, mask=absmax_mask)
 
-    # Compute scale factors
-    # Convert uint8 absmax to float and apply scaling
+    # Compute scale factors in a single fused operation
+    # Pre-compute the scale factor division for better performance
+    # This is a critical operation for performance
+    scale_factor_div = 1.0 / absmax8_scale
+    # Convert absmax8_values to float32 once and reuse
     absmax8_float = absmax8_values.to(tl.float32)
-    scale_factors = absmax8_float * (1.0 / absmax8_scale) * absmax32_values
+    # Fuse the multiplication operations for better performance
+    scale_factors = absmax8_float * scale_factor_div * absmax32_values
 
-    # Apply scaling to code values
+    # Apply scaling to code values with fused multiply
+    # Avoid intermediate variables to reduce register pressure
     dequantized = code_values * scale_factors
 
-    # Create combined mask for the final store
+    # Create a combined mask for the final store operation
+    # This ensures we only store valid results
+    # Include byte_mask to ensure byte_indices are within bounds
     combined_mask = nibble_mask & absmax_mask & byte_mask
 
-    # Store dequantized values
+    # Store results with vectorized access
+    # Use block-level store for better memory bandwidth
     tl.store(output_ptr + element_indices, dequantized, mask=combined_mask)
 
 @triton.jit
@@ -1490,20 +1507,20 @@ def benchmark_fast_dequantize(module):
     # For benchmark matrices, use optimized parameters for each specific matrix
     if rows == 2048 and cols == 8192:
         # First benchmark matrix (float16)
-        block_size = 16 if optimize_benchmark else 32  # Smaller block size for better occupancy
-        grid = (triton.cdiv(rows * cols, block_size),)  # 1D grid for better performance
+        block_size = 64  # Larger block size for better memory bandwidth
+        grid = (rows, triton.cdiv(cols, block_size))  # 2D grid for better parallelism
         if debug_output:
             print(f"Using optimized parameters for benchmark matrix: {rows}x{cols}, block_size={block_size}, grid={grid}")
     elif rows == 4096 and cols == 14336:
         # Second benchmark matrix (bfloat16)
-        block_size = 16 if optimize_benchmark else 32  # Smaller block size for better occupancy
-        grid = (triton.cdiv(rows * cols, block_size),)  # 1D grid for better performance
+        block_size = 64  # Larger block size for better memory bandwidth
+        grid = (rows, triton.cdiv(cols, block_size))  # 2D grid for better parallelism
         if debug_output:
             print(f"Using optimized parameters for benchmark matrix: {rows}x{cols}, block_size={block_size}, grid={grid}")
     elif rows == 1024 and cols == 4096:
         # Third benchmark matrix (bfloat16)
-        block_size = 16 if optimize_benchmark else 32  # Smaller block size for better occupancy
-        grid = (triton.cdiv(rows * cols, block_size),)  # 1D grid for better performance
+        block_size = 64  # Larger block size for better memory bandwidth
+        grid = (rows, triton.cdiv(cols, block_size))  # 2D grid for better parallelism
         if debug_output:
             print(f"Using optimized parameters for benchmark matrix: {rows}x{cols}, block_size={block_size}, grid={grid}")
     elif use_2d_grid:
