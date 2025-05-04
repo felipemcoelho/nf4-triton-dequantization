@@ -184,8 +184,8 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
         os.environ['NF4_DEBUG'] = "0"                   # Disable debug mode
         os.environ['NF4_ALWAYS_VERIFY'] = "0"           # Never verify results
         os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"   # Skip all verification steps
-        os.environ['NF4_USE_2D_GRID'] = "1"             # Use 2D grid for better parallelism
-        os.environ['NF4_BLOCK_SIZE'] = "128"            # Use larger block size for better memory bandwidth
+        os.environ['NF4_USE_2D_GRID'] = "0"             # Use 1D grid for better performance
+        os.environ['NF4_BLOCK_SIZE'] = "32"             # Use smaller block size for maximum parallelism
         os.environ['NF4_DIRECT_KERNEL'] = "1"           # Use direct kernel launch for benchmark matrices
 
         # Set optimal scale factors for benchmark matrices
@@ -345,10 +345,10 @@ def run_benchmarks(iterations=1000, warmup=2):
     os.environ['NF4_ABSMAX8_SCALE'] = "127.0"
 
     # Additional optimizations for benchmark mode
-    # Use 2D grid for better parallelism
-    os.environ['NF4_USE_2D_GRID'] = "1"
-    # Use larger block size for better memory bandwidth
-    os.environ['NF4_BLOCK_SIZE'] = "128"
+    # Use 1D grid for better performance
+    os.environ['NF4_USE_2D_GRID'] = "0"
+    # Use smaller block size for maximum parallelism
+    os.environ['NF4_BLOCK_SIZE'] = "32"
     # Skip all verification steps
     os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"
     # Use direct kernel launch for benchmark matrices
