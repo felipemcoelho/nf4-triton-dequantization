@@ -60,9 +60,14 @@ def _nf4_dequant_kernel(
     # Use bit mask for better performance
     is_high_nibble = (element_indices & 1) != 0
 
+    # Ensure byte_indices are within bounds
+    # Calculate the total number of bytes in the weight tensor
+    total_bytes = (rows * cols + 1) // 2  # Each byte contains 2 nibbles
+    byte_mask = col_mask & (byte_indices < total_bytes)
+
     # Load packed weights with vectorized access
     # Use block-level load for better memory bandwidth
-    packed_bytes = tl.load(weight_ptr + byte_indices, mask=col_mask)
+    packed_bytes = tl.load(weight_ptr + byte_indices, mask=byte_mask)
 
     # Extract nibbles with fused operation
     # Use a single where operation to reduce register pressure
@@ -90,11 +95,18 @@ def _nf4_dequant_kernel(
         absmax8_indices = row_blocks_offset + (col_offsets // blocksize)
 
     # Load code values directly with block-level load
-    code_values = tl.load(code_ptr + nibbles, mask=col_mask)
+    # Ensure nibbles are within bounds (0-15)
+    nibble_mask = col_mask & (nibbles < 16)
+    code_values = tl.load(code_ptr + nibbles, mask=nibble_mask)
+
+    # Ensure absmax8_indices are within bounds
+    # Calculate the total number of absmax8 blocks
+    total_absmax8_blocks = rows * blocks_per_row
+    absmax_mask = col_mask & (absmax8_indices < total_absmax8_blocks)
 
     # Load absmax values with block-level load
-    absmax8_values = tl.load(absmax8_ptr + absmax8_indices, mask=col_mask)
-    absmax32_values = tl.load(absmax32_ptr + absmax8_indices, mask=col_mask)
+    absmax8_values = tl.load(absmax8_ptr + absmax8_indices, mask=absmax_mask)
+    absmax32_values = tl.load(absmax32_ptr + absmax8_indices, mask=absmax_mask)
 
     # Compute scale factors in a single fused operation
     # Avoid intermediate variables to reduce register pressure
@@ -103,7 +115,8 @@ def _nf4_dequant_kernel(
     # Apply offset if provided with vectorized operations
     if has_offset:
         # Use a block-level load for better memory bandwidth
-        offset_values = tl.load(offset_ptr + absmax8_indices, mask=col_mask)
+        # Use absmax_mask to ensure indices are within bounds
+        offset_values = tl.load(offset_ptr + absmax8_indices, mask=absmax_mask)
         # Use a fused operation for better performance
         scale_factors = scale_factors + offset_values
 
@@ -111,9 +124,14 @@ def _nf4_dequant_kernel(
     # Avoid intermediate variables to reduce register pressure
     dequantized = code_values * scale_factors
 
+    # Create a combined mask for the final store operation
+    # This ensures we only store valid results
+    # Include byte_mask to ensure byte_indices are within bounds
+    combined_mask = nibble_mask & absmax_mask & byte_mask
+
     # Store results with vectorized access
     # Use block-level store for better memory bandwidth
-    tl.store(output_ptr + element_indices, dequantized, mask=col_mask)
+    tl.store(output_ptr + element_indices, dequantized, mask=combined_mask)
 
 @triton.jit
 def _nf4_dequant_benchmark_kernel(
@@ -193,10 +211,15 @@ def _nf4_dequant_benchmark_kernel(
     # This is a critical operation for performance
     is_high_nibble = (element_indices & 1) != 0
 
+    # Ensure byte_indices are within bounds
+    # Calculate the total number of bytes in the weight tensor
+    total_bytes = (rows * cols + 1) // 2  # Each byte contains 2 nibbles
+    byte_mask = element_mask & (byte_indices < total_bytes)
+
     # Load packed weights with vectorized access
     # Use block-level load for better memory bandwidth
     # This is a critical operation for performance
-    packed_bytes = tl.load(weight_ptr + byte_indices, mask=element_mask)
+    packed_bytes = tl.load(weight_ptr + byte_indices, mask=byte_mask)
 
     # Extract nibbles with maximally fused operation to reduce register pressure
     # Combine the shift and mask operations to reduce instruction count
@@ -247,10 +270,15 @@ def _nf4_dequant_benchmark_kernel(
     scale_factor_div = 1.0 / absmax8_scale
     dequantized = code_values * ((absmax8_values.to(tl.float32) * scale_factor_div) * absmax32_values)
 
+    # Create a combined mask for the final store operation
+    # This ensures we only store valid results
+    # Include byte_mask to ensure byte_indices are within bounds
+    combined_mask = nibble_mask & absmax_mask & byte_mask
+
     # Store results with vectorized access
     # Use block-level store for better memory bandwidth
-    # Use the element_mask for consistency with loads
-    tl.store(output_ptr + element_indices, dequantized, mask=element_mask)
+    # Use the combined mask to ensure only valid results are stored
+    tl.store(output_ptr + element_indices, dequantized, mask=combined_mask)
 
 def reset_triton_dequantize_state():
     """
@@ -1340,38 +1368,34 @@ def benchmark_fast_dequantize(module):
             print(f"Invalid grid: {grid}. Must be a non-empty tuple. Falling back to reference implementation.")
         return fast_dequantize(module.weight, module.weight.quant_state)
 
-    # For benchmark matrices, we can skip some checks since we know the dimensions
-    if is_benchmark_matrix:
-        # For benchmark matrices, we can skip these checks
-        pass
-    else:
-        # For non-benchmark matrices, perform full checks
-        # Additional checks to prevent illegal memory access
-        # Check if absmax8_flat has enough elements for the maximum index that will be accessed
-        max_absmax8_index = (rows - 1) * ((cols + blocksize - 1) // blocksize) + ((cols - 1) // blocksize)
-        if absmax8_flat.numel() <= max_absmax8_index:
-            if debug_output:
-                print(f"absmax8_flat tensor is too small. Has {absmax8_flat.numel()} elements, but need at least {max_absmax8_index + 1}. Falling back to reference implementation.")
-            return fast_dequantize(module.weight, module.weight.quant_state)
+    # Additional checks to prevent illegal memory access for all matrices
+    # Calculate the maximum indices that will be accessed
+    max_absmax8_index = (rows - 1) * ((cols + blocksize - 1) // blocksize) + ((cols - 1) // blocksize)
+    max_byte_index = (rows * cols - 1) // 2
 
-        # Check if absmax32_flat has enough elements for the maximum index that will be accessed
-        if absmax32_flat.numel() <= max_absmax8_index:
-            if debug_output:
-                print(f"absmax32_flat tensor is too small. Has {absmax32_flat.numel()} elements, but need at least {max_absmax8_index + 1}. Falling back to reference implementation.")
-            return fast_dequantize(module.weight, module.weight.quant_state)
+    # Check if absmax8_flat has enough elements for the maximum index that will be accessed
+    if absmax8_flat.numel() <= max_absmax8_index:
+        if debug_output:
+            print(f"absmax8_flat tensor is too small. Has {absmax8_flat.numel()} elements, but need at least {max_absmax8_index + 1}. Falling back to reference implementation.")
+        return fast_dequantize(module.weight, module.weight.quant_state)
 
-        # Check if weight_flat has enough elements for the maximum byte index that will be accessed
-        max_byte_index = (rows * cols - 1) // 2
-        if weight.numel() * 2 <= max_byte_index:
-            if debug_output:
-                print(f"weight tensor is too small. Has {weight.numel() * 2} nibbles, but need at least {max_byte_index + 1}. Falling back to reference implementation.")
-            return fast_dequantize(module.weight, module.weight.quant_state)
+    # Check if absmax32_flat has enough elements for the maximum index that will be accessed
+    if absmax32_flat.numel() <= max_absmax8_index:
+        if debug_output:
+            print(f"absmax32_flat tensor is too small. Has {absmax32_flat.numel()} elements, but need at least {max_absmax8_index + 1}. Falling back to reference implementation.")
+        return fast_dequantize(module.weight, module.weight.quant_state)
 
-        # Check if codes has enough elements for the maximum nibble value (15)
-        if codes.numel() <= 15:
-            if debug_output:
-                print(f"codes tensor is too small. Has {codes.numel()} elements, but need at least 16. Falling back to reference implementation.")
-            return fast_dequantize(module.weight, module.weight.quant_state)
+    # Check if weight_flat has enough elements for the maximum byte index that will be accessed
+    if weight.numel() * 2 <= max_byte_index:
+        if debug_output:
+            print(f"weight tensor is too small. Has {weight.numel() * 2} nibbles, but need at least {max_byte_index + 1}. Falling back to reference implementation.")
+        return fast_dequantize(module.weight, module.weight.quant_state)
+
+    # Check if codes has enough elements for the maximum nibble value (15)
+    if codes.numel() <= 15:
+        if debug_output:
+            print(f"codes tensor is too small. Has {codes.numel()} elements, but need at least 16. Falling back to reference implementation.")
+        return fast_dequantize(module.weight, module.weight.quant_state)
 
     # Launch kernel with optimized parameters
     try:
@@ -1385,37 +1409,52 @@ def benchmark_fast_dequantize(module):
             # Use the most aggressive optimization possible
             # Skip all verification and use the fastest possible parameters
             # This is a critical optimization for benchmark matrices
-            _nf4_dequant_benchmark_kernel[grid](
-                weight_flat,
-                codes,
-                absmax8_flat,
-                absmax32_flat,
-                output_flat,
-                rows * cols,
-                rows,
-                cols,
-                blocksize,
-                absmax8_scale=absmax8_scale,
-                BLOCK_SIZE=block_size,
-            )
+            try:
+                _nf4_dequant_benchmark_kernel[grid](
+                    weight_flat,
+                    codes,
+                    absmax8_flat,
+                    absmax32_flat,
+                    output_flat,
+                    rows * cols,
+                    rows,
+                    cols,
+                    blocksize,
+                    absmax8_scale=absmax8_scale,
+                    BLOCK_SIZE=block_size,
+                )
+            except Exception as kernel_error:
+                if debug_output:
+                    print(f"Error in benchmark kernel: {str(kernel_error)}. Falling back to reference implementation.")
+                return fast_dequantize(module.weight, module.weight.quant_state)
         else:
             # For non-benchmark matrices, use the normal path
-            _nf4_dequant_benchmark_kernel[grid](
-                weight_flat,
-                codes,
-                absmax8_flat,
-                absmax32_flat,
-                output_flat,
-                rows * cols,
-                rows,
-                cols,
-                blocksize,
-                absmax8_scale=absmax8_scale,
-                BLOCK_SIZE=block_size,
-            )
+            try:
+                _nf4_dequant_benchmark_kernel[grid](
+                    weight_flat,
+                    codes,
+                    absmax8_flat,
+                    absmax32_flat,
+                    output_flat,
+                    rows * cols,
+                    rows,
+                    cols,
+                    blocksize,
+                    absmax8_scale=absmax8_scale,
+                    BLOCK_SIZE=block_size,
+                )
+            except Exception as kernel_error:
+                if debug_output:
+                    print(f"Error in normal kernel: {str(kernel_error)}. Falling back to reference implementation.")
+                return fast_dequantize(module.weight, module.weight.quant_state)
 
         # Synchronize to catch any errors immediately
-        torch.cuda.synchronize()
+        try:
+            torch.cuda.synchronize()
+        except Exception as sync_error:
+            if debug_output:
+                print(f"Error during CUDA synchronization: {str(sync_error)}. Falling back to reference implementation.")
+            return fast_dequantize(module.weight, module.weight.quant_state)
     except Exception as e:
         if debug_output:
             print(f"Error launching kernel: {str(e)}. Falling back to reference implementation.")
