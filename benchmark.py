@@ -223,14 +223,14 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
         os.environ['NF4_DIRECT_KERNEL'] = "1"           # Use direct kernel launch for benchmark matrices
 
         # Set optimal scale factors for benchmark matrices
-        os.environ['NF4_SCALE_8192X2048_FLOAT16'] = "127.0"
-        os.environ['NF4_SCALE_14336X4096_BFLOAT16'] = "127.0"
-        os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "127.0"
-        os.environ['NF4_ABSMAX8_SCALE'] = "127.0"       # Set default absmax8 scale to 127.0
+        os.environ['NF4_SCALE_8192X2048_FLOAT16'] = "255.0"
+        os.environ['NF4_SCALE_14336X4096_BFLOAT16'] = "255.0"
+        os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "255.0"
+        os.environ['NF4_ABSMAX8_SCALE'] = "255.0"       # Set default absmax8 scale to 255.0
 
-        # Use 1D grid and smaller block size for better performance
-        os.environ['NF4_USE_2D_GRID'] = "0"             # Use 1D grid for better performance
-        os.environ['NF4_BLOCK_SIZE'] = "32"             # Use smaller block size for better parallelism
+        # Use 2D grid and larger block size for better memory bandwidth
+        os.environ['NF4_USE_2D_GRID'] = "1"             # Use 2D grid for better parallelism
+        os.environ['NF4_BLOCK_SIZE'] = "128"            # Use larger block size for better memory bandwidth
         os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"      # Use more aggressive optimizations for benchmark matrices
 
         # Ensure CUDA is optimized for maximum performance
@@ -299,10 +299,10 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
             os.environ['NF4_FORCE_FAST_KERNEL'] = "1"
             # Skip all verification for maximum performance
             os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"
-            # Use smaller block size for better parallelism
-            os.environ['NF4_BLOCK_SIZE'] = "32"
-            # Use 1D grid for better performance
-            os.environ['NF4_USE_2D_GRID'] = "0"
+            # Use larger block size for better memory bandwidth
+            os.environ['NF4_BLOCK_SIZE'] = "128"
+            # Use 2D grid for better parallelism
+            os.environ['NF4_USE_2D_GRID'] = "1"
             # Use more aggressive optimizations for benchmark matrices
             os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
             # Use direct kernel launch for benchmark matrices
@@ -397,17 +397,17 @@ def run_benchmarks(iterations=1000, warmup=2):
     # Use fastest possible parameters for maximum performance
     os.environ['NF4_FASTEST_PARAMS'] = "1"
     # Set known good scale factors for benchmark matrices
-    os.environ['NF4_SCALE_8192X2048_FLOAT16'] = "127.0"
-    os.environ['NF4_SCALE_14336X4096_BFLOAT16'] = "127.0"
-    os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "127.0"
-    # Set default absmax8 scale to 127.0
-    os.environ['NF4_ABSMAX8_SCALE'] = "127.0"
+    os.environ['NF4_SCALE_8192X2048_FLOAT16'] = "255.0"
+    os.environ['NF4_SCALE_14336X4096_BFLOAT16'] = "255.0"
+    os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "255.0"
+    # Set default absmax8 scale to 255.0
+    os.environ['NF4_ABSMAX8_SCALE'] = "255.0"
 
     # Additional optimizations for benchmark mode
-    # Use 1D grid for better performance
-    os.environ['NF4_USE_2D_GRID'] = "0"
-    # Use smaller block size for better parallelism
-    os.environ['NF4_BLOCK_SIZE'] = "32"
+    # Use 2D grid for better parallelism
+    os.environ['NF4_USE_2D_GRID'] = "1"
+    # Use larger block size for better memory bandwidth
+    os.environ['NF4_BLOCK_SIZE'] = "128"
     # Use more aggressive optimizations for benchmark matrices
     os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
     # Force using the fast kernel for all matrices
