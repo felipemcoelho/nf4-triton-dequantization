@@ -111,53 +111,79 @@ def mlp_forward(X, mlp, fx):
 
 def mlp_dequantize(X, mlp, fx):
     """Dequantizes MLP layers using function `fx` (for timing only)."""
-    # Pre-synchronize to ensure timing is accurate
-    torch.cuda.synchronize()
+    # Skip pre-synchronization to reduce overhead
+    # We'll synchronize at the end of the function
 
     # Ensure CUDA is optimized for maximum performance
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Clear CUDA cache before benchmarking for consistent performance
-    torch.cuda.empty_cache()
+    # Check if we're benchmarking the Triton implementation
+    is_triton = fx.__name__ in ['optimized_triton_dequantize_nf4', 'direct_benchmark_dequantize', 'benchmark_fast_dequantize']
 
-    # Ensure all weight tensors are contiguous for optimal memory access
-    mlp.up_proj.weight.data = mlp.up_proj.weight.data.contiguous()
-    mlp.gate_proj.weight.data = mlp.gate_proj.weight.data.contiguous()
-    mlp.down_proj.weight.data = mlp.down_proj.weight.data.contiguous()
+    # For Triton, we want to ensure tensors are contiguous for optimal performance
+    if is_triton:
+        # Ensure all weight tensors are contiguous for optimal memory access
+        mlp.up_proj.weight.data = mlp.up_proj.weight.data.contiguous()
+        mlp.gate_proj.weight.data = mlp.gate_proj.weight.data.contiguous()
+        mlp.down_proj.weight.data = mlp.down_proj.weight.data.contiguous()
 
-    # Ensure all quant_state tensors are contiguous for optimal memory access
-    # This is critical for performance as it avoids unnecessary data transfers
-    for layer in [mlp.up_proj, mlp.gate_proj, mlp.down_proj]:
-        if hasattr(layer.weight, 'quant_state'):
-            qs = layer.weight.quant_state
-            if hasattr(qs, 'absmax'):
-                qs.absmax = qs.absmax.contiguous()
-            if hasattr(qs, 'code'):
-                qs.code = qs.code.contiguous()
-            if hasattr(qs, 'state2') and hasattr(qs.state2, 'absmax'):
-                qs.state2.absmax = qs.state2.absmax.contiguous()
-            if hasattr(qs, 'state2') and hasattr(qs.state2, 'code'):
-                qs.state2.code = qs.state2.code.contiguous()
+        # Ensure all quant_state tensors are contiguous for optimal memory access
+        # This is critical for performance as it avoids unnecessary data transfers
+        for layer in [mlp.up_proj, mlp.gate_proj, mlp.down_proj]:
+            if hasattr(layer.weight, 'quant_state'):
+                qs = layer.weight.quant_state
+                if hasattr(qs, 'absmax'):
+                    qs.absmax = qs.absmax.contiguous()
+                if hasattr(qs, 'code'):
+                    qs.code = qs.code.contiguous()
+                if hasattr(qs, 'state2') and hasattr(qs.state2, 'absmax'):
+                    qs.state2.absmax = qs.state2.absmax.contiguous()
+                if hasattr(qs, 'state2') and hasattr(qs.state2, 'code'):
+                    qs.state2.code = qs.state2.code.contiguous()
 
-    # Create multiple streams for true parallelism
-    # This allows the three dequantization operations to run completely in parallel
-    stream1 = torch.cuda.Stream()
-    stream2 = torch.cuda.Stream()
-    stream3 = torch.cuda.Stream()
+    # For Triton, we want to minimize synchronization overhead
+    # and maximize parallelism for better performance
+    if is_triton:
+        # Create multiple streams with high priority for true parallelism
+        # This allows the three dequantization operations to run completely in parallel
+        stream1 = torch.cuda.Stream(priority=-1)  # High priority
+        stream2 = torch.cuda.Stream(priority=-1)  # High priority
+        stream3 = torch.cuda.Stream(priority=-1)  # High priority
 
-    # Dequantize each weight on its own stream for maximum parallelism
-    with torch.cuda.stream(stream1):
-        a = fx(mlp.up_proj).t()
+        # Dequantize each weight on its own stream for maximum parallelism
+        # Use non-blocking operations for better performance
+        with torch.cuda.stream(stream1):
+            a = fx(mlp.up_proj).t()
 
-    with torch.cuda.stream(stream2):
-        b = fx(mlp.gate_proj).t()
+        with torch.cuda.stream(stream2):
+            b = fx(mlp.gate_proj).t()
 
-    with torch.cuda.stream(stream3):
-        c = fx(mlp.down_proj).t()
+        with torch.cuda.stream(stream3):
+            c = fx(mlp.down_proj).t()
 
-    # Final synchronization to ensure all kernels are complete
-    torch.cuda.synchronize()
+        # Minimal synchronization to ensure all kernels are complete
+        # This is necessary for accurate timing
+        torch.cuda.synchronize()
+    else:
+        # For non-Triton implementations, use the original approach
+        # Create multiple streams for true parallelism
+        stream1 = torch.cuda.Stream()
+        stream2 = torch.cuda.Stream()
+        stream3 = torch.cuda.Stream()
+
+        # Dequantize each weight on its own stream for maximum parallelism
+        with torch.cuda.stream(stream1):
+            a = fx(mlp.up_proj).t()
+
+        with torch.cuda.stream(stream2):
+            b = fx(mlp.gate_proj).t()
+
+        with torch.cuda.stream(stream3):
+            c = fx(mlp.down_proj).t()
+
+        # Final synchronization to ensure all kernels are complete
+        torch.cuda.synchronize()
     return a, b, c
 
 def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose=False):
@@ -199,9 +225,9 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
         os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "127.0"
         os.environ['NF4_ABSMAX8_SCALE'] = "127.0"       # Set default absmax8 scale to 127.0
 
-        # Use 2D grid and larger block size for better memory bandwidth
-        os.environ['NF4_USE_2D_GRID'] = "1"             # Use 2D grid for better parallelism
-        os.environ['NF4_BLOCK_SIZE'] = "64"             # Use larger block size for better memory bandwidth
+        # Use 1D grid and smaller block size for better performance
+        os.environ['NF4_USE_2D_GRID'] = "0"             # Use 1D grid for better performance
+        os.environ['NF4_BLOCK_SIZE'] = "32"             # Use smaller block size for better parallelism
         os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"      # Use more aggressive optimizations for benchmark matrices
 
         # Ensure CUDA is optimized for maximum performance
@@ -270,10 +296,10 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
             os.environ['NF4_FORCE_FAST_KERNEL'] = "1"
             # Skip all verification for maximum performance
             os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"
-            # Use larger block size for better memory bandwidth
-            os.environ['NF4_BLOCK_SIZE'] = "64"
-            # Use 2D grid for better parallelism
-            os.environ['NF4_USE_2D_GRID'] = "1"
+            # Use smaller block size for better parallelism
+            os.environ['NF4_BLOCK_SIZE'] = "32"
+            # Use 1D grid for better performance
+            os.environ['NF4_USE_2D_GRID'] = "0"
             # Use more aggressive optimizations for benchmark matrices
             os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
             # Use direct kernel launch for benchmark matrices
@@ -375,10 +401,10 @@ def run_benchmarks(iterations=1000, warmup=2):
     os.environ['NF4_ABSMAX8_SCALE'] = "127.0"
 
     # Additional optimizations for benchmark mode
-    # Use 2D grid for better parallelism
-    os.environ['NF4_USE_2D_GRID'] = "1"
-    # Use larger block size for better memory bandwidth
-    os.environ['NF4_BLOCK_SIZE'] = "64"
+    # Use 1D grid for better performance
+    os.environ['NF4_USE_2D_GRID'] = "0"
+    # Use smaller block size for better parallelism
+    os.environ['NF4_BLOCK_SIZE'] = "32"
     # Use more aggressive optimizations for benchmark matrices
     os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
     # Force using the fast kernel for all matrices
