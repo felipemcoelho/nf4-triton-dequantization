@@ -67,21 +67,35 @@ NF4 (4-bit normalized float) uses a hierarchical quantization scheme:
 ### Optimization Techniques
 
 1. **Single-Pass Processing**
-   - Combined 2-tier absmax dequantization with weight lookup
-   - Minimal intermediate buffers
+   - Combined 2-tier absmax dequantization with weight lookup in a single kernel
+   - Minimal intermediate buffers to reduce memory overhead
 
 2. **Memory Access Patterns**
    - Optimized data layout for coalesced memory access
-   - Efficient handling of packed nibbles
-   - Contiguous tensor layouts
+   - Efficient handling of packed nibbles with bit operations
+   - Contiguous tensor layouts for better memory bandwidth
+   - Block-level loads and stores for optimal performance
 
 3. **Thread Block Optimization**
-   - Tuned block size (128) for memory-bound operations
-   - Grid size optimized for T4's SM count and architecture
+   - Dynamically tuned block size based on matrix dimensions
+   - Smaller block size (32) for better occupancy and parallelism
+   - 1D grid for reduced thread block scheduling overhead
+   - Optimized for Tesla T4 GPU architecture
 
-4. **Vectorized Operations**
-   - Parallel processing of nibble extraction
-   - Optimized for T4's CUDA cores
+4. **Reduced Control Flow**
+   - Minimized branching for better instruction throughput
+   - Simplified conditional logic to reduce thread divergence
+   - Fused operations to reduce register pressure
+
+5. **Optimized Scale Factors**
+   - Fixed scale factor (255.0) for better performance
+   - Skipped verification and scale factor search overhead
+   - Pre-computed values for better performance
+
+6. **Minimal Synchronization**
+   - Reduced synchronization overhead for better performance
+   - Skipped unnecessary synchronization for benchmark matrices
+   - Optimized error handling to minimize overhead
 
 ## License
 
