@@ -163,7 +163,7 @@ def _fast_nf4_dequant_kernel(
     - Minimal branching for better instruction throughput
     - Optimized memory access patterns for coalesced access
     - Fused operations to reduce register pressure
-    - Minimal bounds checking for better performance
+    - Careful bounds checking to prevent illegal memory access
     - Specialized for benchmark matrices
     """
     # Use 1D grid for maximum parallelism
@@ -248,9 +248,9 @@ def _fast_nf4_dequant_kernel(
     absmax_mask = col_mask & (absmax8_indices < total_absmax_blocks)
 
     # Create mask for valid nibble values (0-15)
-    # This is a simple bounds check that can be optimized out
-    # for most cases since nibbles are always < 16
-    nibble_mask = col_mask
+    # This is a simple bounds check that ensures nibbles are within bounds
+    # This prevents illegal memory access when loading code values
+    nibble_mask = col_mask & (nibbles < 16)
 
     # Load code values (the actual values corresponding to each nibble)
     # Use block-level load for better memory bandwidth
@@ -278,7 +278,8 @@ def _fast_nf4_dequant_kernel(
     # Create a combined mask for the final store operation
     # This ensures we only store valid results
     # Include byte_mask to ensure byte_indices are within bounds
-    combined_mask = col_mask & absmax_mask & byte_mask
+    # Include nibble_mask to ensure nibbles are within bounds
+    combined_mask = nibble_mask & absmax_mask & byte_mask
 
     # Store results with vectorized access
     # Use block-level store for better memory bandwidth
@@ -392,9 +393,9 @@ def _nf4_dequant_benchmark_kernel(
     absmax_mask = col_mask & (absmax8_indices < total_absmax_blocks)
 
     # Create mask for valid nibble values (0-15)
-    # This is a simple bounds check that can be optimized out
-    # for most cases since nibbles are always < 16
-    nibble_mask = col_mask
+    # This is a simple bounds check that ensures nibbles are within bounds
+    # This prevents illegal memory access when loading code values
+    nibble_mask = col_mask & (nibbles < 16)
 
     # Load code values (the actual values corresponding to each nibble)
     # Use block-level load for better memory bandwidth
@@ -422,7 +423,8 @@ def _nf4_dequant_benchmark_kernel(
     # Create a combined mask for the final store operation
     # This ensures we only store valid results
     # Include byte_mask to ensure byte_indices are within bounds
-    combined_mask = col_mask & absmax_mask & byte_mask
+    # Include nibble_mask to ensure nibbles are within bounds
+    combined_mask = nibble_mask & absmax_mask & byte_mask
 
     # Store results with vectorized access
     # Use block-level store for better memory bandwidth
