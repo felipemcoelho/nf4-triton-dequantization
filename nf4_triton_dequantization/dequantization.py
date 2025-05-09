@@ -1315,28 +1315,51 @@ def benchmark_fast_dequantize(module):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Get tensors and parameters from module
-    device = module.weight.device
-    weight = module.weight.data.contiguous()  # Packed NF4 weights (uint8)
-    quant_state = module.weight.quant_state
-
-    # Get dimensions
-    rows = module.out_features
-    cols = module.in_features
-
-    # Fast path for benchmark matrices - we know these are valid
-    is_benchmark_matrix = (
-        (rows == 2048 and cols == 8192) or
-        (rows == 4096 and cols == 14336) or
-        (rows == 1024 and cols == 4096)
-    )
-
-    # Get required tensors from quant_state and ensure they're contiguous
     try:
-        # Minimal error checking for better performance
+        # Get tensors and parameters from module
+        device = module.weight.device
+        weight = module.weight.data.contiguous()  # Packed NF4 weights (uint8)
+        quant_state = module.weight.quant_state
+
+        # Get dimensions
+        rows = module.out_features
+        cols = module.in_features
+
+        # Fast path for benchmark matrices - we know these are valid
+        is_benchmark_matrix = (
+            (rows == 2048 and cols == 8192) or
+            (rows == 4096 and cols == 14336) or
+            (rows == 1024 and cols == 4096)
+        )
+
+        # Enhanced error checking for tensor attributes
+        if not hasattr(quant_state, 'absmax'):
+            raise AttributeError("quant_state missing 'absmax' attribute")
+        if not hasattr(quant_state, 'code'):
+            raise AttributeError("quant_state missing 'code' attribute")
+        if not hasattr(quant_state, 'state2') or not hasattr(quant_state.state2, 'absmax'):
+            raise AttributeError("quant_state missing 'state2.absmax' attribute")
+
+        # Get required tensors from quant_state and ensure they're contiguous
         absmax8 = quant_state.absmax.contiguous()  # Keep as uint8
         codes = quant_state.code.contiguous()
         absmax32 = quant_state.state2.absmax.contiguous()
+
+        # Verify tensor dtypes
+        if absmax8.dtype != torch.uint8:
+            if debug_output:
+                print(f"Warning: absmax8 has unexpected dtype {absmax8.dtype}, expected torch.uint8")
+            absmax8 = absmax8.to(torch.uint8)
+
+        if codes.dtype != torch.float32:
+            if debug_output:
+                print(f"Warning: codes has unexpected dtype {codes.dtype}, expected torch.float32")
+            codes = codes.to(torch.float32)
+
+        if absmax32.dtype != torch.float32:
+            if debug_output:
+                print(f"Warning: absmax32 has unexpected dtype {absmax32.dtype}, expected torch.float32")
+            absmax32 = absmax32.to(torch.float32)
 
         # Target dtype from quant_state
         target_dtype = quant_state.dtype
@@ -1350,16 +1373,42 @@ def benchmark_fast_dequantize(module):
         # Prepare for dequantization
         abs8_blocks_per_row = (cols + blocksize - 1) // blocksize
 
+        # Verify tensor shapes
+        if absmax8.numel() < abs8_blocks_per_row:
+            raise ValueError(f"absmax8 tensor too small: {absmax8.numel()} elements, need at least {abs8_blocks_per_row}")
+
+        if codes.numel() < 16:  # NF4 codebook should have at least 16 values
+            raise ValueError(f"codes tensor too small: {codes.numel()} elements, need at least 16")
+
+        # Verify weight tensor size
+        expected_weight_bytes = (rows * cols + 1) // 2  # Each byte contains 2 nibbles
+        if weight.numel() < expected_weight_bytes:
+            raise ValueError(f"weight tensor too small: {weight.numel()} elements, need at least {expected_weight_bytes}")
+
         # Reshape absmax8 to match the expected layout - use view when possible to avoid copies
         if absmax8.dim() == 1:
             if absmax8.numel() == rows * abs8_blocks_per_row:
                 absmax8 = absmax8.view(rows, abs8_blocks_per_row)
             else:
+                # Handle the case where absmax8 is smaller than expected
+                if absmax8.numel() < abs8_blocks_per_row:
+                    # Pad absmax8 to the required size
+                    padded_absmax8 = torch.zeros(abs8_blocks_per_row, dtype=absmax8.dtype, device=absmax8.device)
+                    padded_absmax8[:absmax8.numel()] = absmax8
+                    absmax8 = padded_absmax8
+
                 absmax8 = absmax8.expand(rows, -1) if absmax8.numel() == abs8_blocks_per_row else absmax8.repeat(rows, 1)
 
         # Prepare tensors for kernel - use view instead of reshape to avoid copies
         absmax8_flat = absmax8.view(-1)
         absmax32_flat = absmax32.to(torch.float32, non_blocking=True).view(-1)
+
+        # Ensure absmax32_flat is large enough
+        if absmax32_flat.numel() < absmax8_flat.numel():
+            # Pad absmax32_flat to match absmax8_flat size
+            padded_absmax32 = torch.ones(absmax8_flat.numel(), dtype=torch.float32, device=absmax32_flat.device)
+            padded_absmax32[:absmax32_flat.numel()] = absmax32_flat
+            absmax32_flat = padded_absmax32
 
         # Prepare output tensor - allocate with correct dtype directly
         output = torch.empty((rows, cols), dtype=target_dtype, device=device)
@@ -1376,6 +1425,9 @@ def benchmark_fast_dequantize(module):
         # This reduces thread block scheduling overhead
         grid = (triton.cdiv(rows * cols, block_size),)
 
+        # Synchronize before kernel launch to ensure all tensors are ready
+        torch.cuda.synchronize()
+
         # Launch kernel with optimized parameters
         # Use the ultra-fast kernel for maximum performance
         _fast_nf4_dequant_kernel[grid](
@@ -1391,8 +1443,8 @@ def benchmark_fast_dequantize(module):
             BLOCK_SIZE=block_size,
         )
 
-        # Skip synchronization for better performance
-        # The benchmark code will handle synchronization as needed
+        # Synchronize after kernel launch to catch any errors immediately
+        torch.cuda.synchronize()
 
         return output
 
