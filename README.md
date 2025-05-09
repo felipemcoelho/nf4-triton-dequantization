@@ -75,6 +75,7 @@ NF4 (4-bit normalized float) uses a hierarchical quantization scheme:
    - Efficient handling of packed nibbles with bit operations
    - Contiguous tensor layouts for better memory bandwidth
    - Block-level loads and stores for optimal performance
+   - Comprehensive bounds checking to ensure memory safety
 
 3. **Thread Block Optimization**
    - Dynamically tuned block size based on matrix dimensions
