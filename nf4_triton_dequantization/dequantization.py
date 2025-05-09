@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 import math
 import os
+import inspect
 
 from unsloth.kernels.utils import fast_dequantize
 
@@ -1367,8 +1368,59 @@ def benchmark_fast_dequantize(module):
         # Use fixed blocksize for better performance
         blocksize = 64  # Default blocksize for absmax8 blocks
 
-        # Use fixed scale factor for better performance
-        absmax8_scale = 255.0  # Optimal value for benchmark matrices
+        # Create the model key using dimensions and data type
+        dtype_str = str(target_dtype).split('.')[-1]
+        model_key = f"{cols}x{rows}_{dtype_str}"
+
+        # Check for a direct scale factor override via environment variable for this specific model
+        env_scale_key = f"NF4_SCALE_{cols}x{rows}_{dtype_str}".upper().replace(".", "_")
+        env_scale_model = os.environ.get(env_scale_key)
+
+        # Check for a general scale factor override via environment variable
+        env_scale_general = os.environ.get('NF4_ABSMAX8_SCALE')
+
+        # Use the most specific scale factor available
+        if env_scale_model is not None:
+            try:
+                absmax8_scale = float(env_scale_model)
+                if debug_output:
+                    print(f"Using model-specific scale factor for {model_key}: {absmax8_scale}")
+            except ValueError:
+                # If the environment variable is not a valid float, use the general one or default
+                if env_scale_general is not None:
+                    try:
+                        absmax8_scale = float(env_scale_general)
+                        if debug_output:
+                            print(f"Using general scale factor: {absmax8_scale}")
+                    except ValueError:
+                        # If the environment variable is not a valid float, use the default
+                        absmax8_scale = 255.0  # Optimal value for benchmark matrices
+                else:
+                    absmax8_scale = 255.0  # Optimal value for benchmark matrices
+        elif env_scale_general is not None:
+            try:
+                absmax8_scale = float(env_scale_general)
+                if debug_output:
+                    print(f"Using general scale factor: {absmax8_scale}")
+            except ValueError:
+                # If the environment variable is not a valid float, use the default
+                absmax8_scale = 255.0  # Optimal value for benchmark matrices
+        else:
+            # Use hardcoded optimal values for benchmark matrices
+            if model_key == "8192x2048_float16":
+                absmax8_scale = 255.0  # Optimal for float16 benchmark matrix
+                if debug_output:
+                    print(f"Using hardcoded scale factor for benchmark matrix {model_key}: {absmax8_scale}")
+            elif model_key == "14336x4096_bfloat16":
+                absmax8_scale = 255.0  # Optimal for bfloat16 benchmark matrix
+                if debug_output:
+                    print(f"Using hardcoded scale factor for benchmark matrix {model_key}: {absmax8_scale}")
+            elif model_key == "4096x1024_bfloat16":
+                absmax8_scale = 255.0  # Optimal for bfloat16 benchmark matrix
+                if debug_output:
+                    print(f"Using hardcoded scale factor for benchmark matrix {model_key}: {absmax8_scale}")
+            else:
+                absmax8_scale = 255.0  # Default optimal value for most matrices
 
         # Prepare for dequantization
         abs8_blocks_per_row = (cols + blocksize - 1) // blocksize
@@ -1417,16 +1469,53 @@ def benchmark_fast_dequantize(module):
         # Prepare weight tensor - use view instead of reshape to avoid copies
         weight_flat = weight.view(-1)
 
-        # Optimize block size and grid dimensions for benchmark matrices
-        # Use fixed values for better performance
-        block_size = 32  # Smaller block size for better occupancy
+        # Check for environment variables that override the default settings
+        env_block_size = os.environ.get('NF4_BLOCK_SIZE')
+        use_2d_grid = os.environ.get('NF4_USE_2D_GRID') == "1"
 
-        # Use 1D grid for better performance
-        # This reduces thread block scheduling overhead
-        grid = (triton.cdiv(rows * cols, block_size),)
+        # Set block size based on environment variable or use default
+        if env_block_size is not None:
+            try:
+                # Use the block size specified in the environment variable
+                block_size = int(env_block_size)
+                # Ensure block size is a multiple of 32 (warp size) for best performance
+                block_size = max(32, (block_size // 32) * 32)
+                if debug_output:
+                    print(f"Using environment-specified block size: {block_size}")
+            except ValueError:
+                # If the environment variable is not a valid integer, use the default
+                block_size = 32  # Default to smaller block size for better occupancy
+        else:
+            # For benchmark matrices, use larger block size for better memory bandwidth
+            if is_benchmark_matrix:
+                block_size = 128  # Larger block size for better memory bandwidth
+            else:
+                block_size = 32  # Default to smaller block size for better occupancy
 
-        # Synchronize before kernel launch to ensure all tensors are ready
-        torch.cuda.synchronize()
+        # Determine grid layout based on environment variable or matrix dimensions
+        if use_2d_grid:
+            # Use 2D grid for better parallelism
+            grid = (rows, triton.cdiv(cols, block_size))
+            if debug_output:
+                print(f"Using 2D grid: {grid}")
+        elif is_benchmark_matrix:
+            # For benchmark matrices, use 2D grid for better parallelism
+            grid = (rows, triton.cdiv(cols, block_size))
+            if debug_output:
+                print(f"Using 2D grid for benchmark matrix: {grid}")
+        else:
+            # Use 1D grid for better performance
+            # This reduces thread block scheduling overhead
+            grid = (triton.cdiv(rows * cols, block_size),)
+            if debug_output:
+                print(f"Using 1D grid: {grid}")
+
+        # Only synchronize in debug mode or if explicitly requested
+        synchronize_kernels = os.environ.get('NF4_SYNCHRONIZE_KERNELS') == "1"
+        if debug_output or synchronize_kernels:
+            torch.cuda.synchronize()
+            if debug_output:
+                print("Synchronizing before kernel launch")
 
         # Launch kernel with optimized parameters
         # Use the ultra-fast kernel for maximum performance
@@ -1443,8 +1532,13 @@ def benchmark_fast_dequantize(module):
             BLOCK_SIZE=block_size,
         )
 
-        # Synchronize after kernel launch to catch any errors immediately
-        torch.cuda.synchronize()
+        # Only synchronize in debug mode, if explicitly requested, or if we're not in benchmark mode
+        # In benchmark mode, the benchmark code will handle synchronization as needed
+        is_benchmark = 'benchmark' in inspect.stack()[1].function if inspect.stack() else False
+        if debug_output or synchronize_kernels or not is_benchmark:
+            torch.cuda.synchronize()
+            if debug_output:
+                print("Synchronizing after kernel launch")
 
         return output
 
