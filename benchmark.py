@@ -82,22 +82,16 @@ def unsloth_dequantize(weight):
 
 def direct_benchmark_dequantize(weight):
     """
-    Direct wrapper for benchmark_fast_dequantize function.
-
-    This function provides the fastest possible path for dequantization
-    by directly calling benchmark_fast_dequantize, which is optimized for
-    maximum performance on all matrix sizes.
-
-    Key optimizations:
-    - Skips all verification and debug checks
-    - Uses optimized block size and grid dimensions
-    - Ensures all tensors are contiguous for optimal memory access
-    - Uses fixed scale factor for better performance
-    - Minimizes synchronization overhead
+    Direct wrapper for triton_dequantize_nf4 function.
+    
+    This is a simplified, high-performance implementation that:
+    - Uses a single Triton kernel for the entire dequantization process
+    - Avoids unnecessary memory allocations and copies
+    - Optimizes memory access patterns for better performance
+    - Uses hardcoded optimal parameters for maximum speed
     """
-    # Always use the fast path for maximum performance
-    # This is much faster than going through optimized_triton_dequantize_nf4
-    return benchmark_fast_dequantize(weight)
+    # Call the optimized implementation directly
+    return triton_dequantize_nf4(weight)
 
 def mlp_forward(X, mlp, fx):
     """Performs MLP forward pass using dequantized weights from function `fx`."""
@@ -109,79 +103,23 @@ def mlp_forward(X, mlp, fx):
 
 def mlp_dequantize(X, mlp, fx):
     """Dequantizes MLP layers using function `fx` (for timing only)."""
-    # Skip pre-synchronization to reduce overhead
-    # We'll synchronize at the end of the function
+    # Create multiple streams for true parallelism
+    stream1 = torch.cuda.Stream()
+    stream2 = torch.cuda.Stream()
+    stream3 = torch.cuda.Stream()
 
-    # Ensure CUDA is optimized for maximum performance
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+    # Dequantize each weight on its own stream
+    with torch.cuda.stream(stream1):
+        a = fx(mlp.up_proj).t()
 
-    # Check if we're benchmarking the Triton implementation
-    is_triton = fx.__name__ in ['optimized_triton_dequantize_nf4', 'direct_benchmark_dequantize', 'benchmark_fast_dequantize']
+    with torch.cuda.stream(stream2):
+        b = fx(mlp.gate_proj).t()
 
-    # For Triton, we want to ensure tensors are contiguous for optimal performance
-    if is_triton:
-        # Ensure all weight tensors are contiguous for optimal memory access
-        mlp.up_proj.weight.data = mlp.up_proj.weight.data.contiguous()
-        mlp.gate_proj.weight.data = mlp.gate_proj.weight.data.contiguous()
-        mlp.down_proj.weight.data = mlp.down_proj.weight.data.contiguous()
+    with torch.cuda.stream(stream3):
+        c = fx(mlp.down_proj).t()
 
-        # Ensure all quant_state tensors are contiguous for optimal memory access
-        # This is critical for performance as it avoids unnecessary data transfers
-        for layer in [mlp.up_proj, mlp.gate_proj, mlp.down_proj]:
-            if hasattr(layer.weight, 'quant_state'):
-                qs = layer.weight.quant_state
-                if hasattr(qs, 'absmax'):
-                    qs.absmax = qs.absmax.contiguous()
-                if hasattr(qs, 'code'):
-                    qs.code = qs.code.contiguous()
-                if hasattr(qs, 'state2') and hasattr(qs.state2, 'absmax'):
-                    qs.state2.absmax = qs.state2.absmax.contiguous()
-                if hasattr(qs, 'state2') and hasattr(qs.state2, 'code'):
-                    qs.state2.code = qs.state2.code.contiguous()
-
-    # For Triton, we want to minimize synchronization overhead
-    # and maximize parallelism for better performance
-    if is_triton:
-        # Create multiple streams with high priority for true parallelism
-        # This allows the three dequantization operations to run completely in parallel
-        stream1 = torch.cuda.Stream(priority=-1)  # High priority
-        stream2 = torch.cuda.Stream(priority=-1)  # High priority
-        stream3 = torch.cuda.Stream(priority=-1)  # High priority
-
-        # Dequantize each weight on its own stream for maximum parallelism
-        # Use non-blocking operations for better performance
-        with torch.cuda.stream(stream1):
-            a = fx(mlp.up_proj).t()
-
-        with torch.cuda.stream(stream2):
-            b = fx(mlp.gate_proj).t()
-
-        with torch.cuda.stream(stream3):
-            c = fx(mlp.down_proj).t()
-
-        # Minimal synchronization to ensure all kernels are complete
-        # This is necessary for accurate timing
-        torch.cuda.synchronize()
-    else:
-        # For non-Triton implementations, use the original approach
-        # Create multiple streams for true parallelism
-        stream1 = torch.cuda.Stream()
-        stream2 = torch.cuda.Stream()
-        stream3 = torch.cuda.Stream()
-
-        # Dequantize each weight on its own stream for maximum parallelism
-        with torch.cuda.stream(stream1):
-            a = fx(mlp.up_proj).t()
-
-        with torch.cuda.stream(stream2):
-            b = fx(mlp.gate_proj).t()
-
-        with torch.cuda.stream(stream3):
-            c = fx(mlp.down_proj).t()
-
-        # Final synchronization to ensure all kernels are complete
-        torch.cuda.synchronize()
+    # Wait for all operations to complete
+    torch.cuda.synchronize()
     return a, b, c
 
 def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose=False):
@@ -196,45 +134,6 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
 
     results = [] # Stores (hd, m, dt, time)
 
-    # Check if we're benchmarking the Triton implementation
-    is_triton = dequantize_fx.__name__ in ['optimized_triton_dequantize_nf4', 'direct_benchmark_dequantize']
-
-    # For Triton, we want to ensure we're using the fastest possible path
-    if is_triton:
-        # Reset the Triton dequantization state to ensure a fresh start
-        # This ensures we're not using any fallback state from previous runs
-        reset_triton_dequantize_state()
-
-        # Set all environment variables for maximum performance
-        os.environ['NF4_SKIP_VERIFICATION'] = "1"       # Skip all verification
-        os.environ['NF4_FASTEST_PARAMS'] = "1"          # Use fastest parameters
-        os.environ['NF4_FORCE_TRITON'] = "1"            # Force using Triton
-        os.environ['NF4_DEBUG_OUTPUT'] = "0"            # Disable debug output
-        os.environ['NF4_DEBUG'] = "0"                   # Disable debug mode
-        os.environ['NF4_ALWAYS_VERIFY'] = "0"           # Never verify results
-        os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"   # Skip all verification steps
-        os.environ['NF4_USE_2D_GRID'] = "1"             # Use 2D grid for better parallelism
-        os.environ['NF4_BLOCK_SIZE'] = "128"            # Use larger block size for better memory bandwidth
-        os.environ['NF4_DIRECT_KERNEL'] = "1"           # Use direct kernel launch for benchmark matrices
-
-        # Set optimal scale factors for benchmark matrices
-        os.environ['NF4_SCALE_8192X2048_FLOAT16'] = "255.0"
-        os.environ['NF4_SCALE_14336X4096_BFLOAT16'] = "255.0"
-        os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "255.0"
-        os.environ['NF4_ABSMAX8_SCALE'] = "255.0"       # Set default absmax8 scale to 255.0
-
-        # Use 2D grid and larger block size for better memory bandwidth
-        os.environ['NF4_USE_2D_GRID'] = "1"             # Use 2D grid for better parallelism
-        os.environ['NF4_BLOCK_SIZE'] = "128"            # Use larger block size for better memory bandwidth
-        os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"      # Use more aggressive optimizations for benchmark matrices
-
-        # Ensure CUDA is optimized for maximum performance
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-
-        # Clear CUDA cache before benchmarking
-        torch.cuda.empty_cache()
-
     for i, (bsz, qlen, hd, m, seed, dt) in enumerate(options):
         set_seed(seed)
         torch.set_default_dtype(torch.float32) # For model init
@@ -244,106 +143,24 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2, verbose
 
         # Warmup: Ensure correctness and warm up GPU caches
         for _ in range(warmup):
-            # For Triton, use optimized warmup to avoid unnecessary overhead
-            if is_triton:
-                try:
-                    # For Triton, use a more aggressive warmup strategy
-                    # Clear CUDA cache before each warmup iteration
-                    torch.cuda.empty_cache()
-
-                    # Set CUDA device to maximum performance mode
-                    with torch.cuda.device(0):
-                        # Set stream priority to high
-                        stream = torch.cuda.Stream(priority=-1)
-                        with torch.cuda.stream(stream):
-                            # Dequantize weights to warm up the cache
-                            # Use non-blocking operations for better performance
-                            a = dequantize_fx(mlp.up_proj)
-                            b = dequantize_fx(mlp.gate_proj)
-                            c = dequantize_fx(mlp.down_proj)
-
-                            # Force synchronization to ensure kernels complete
-                            torch.cuda.synchronize()
-
-                            # Perform a dummy operation to ensure the GPU is fully warmed up
-                            dummy = a + 0
-                except Exception as e:
-                    print(f"Error during Triton warmup: {e}")
-                    raise
-            else:
-                # For reference implementations, do full verification
-                assert_same(mlp_forward(X, mlp, dequantize_fx), mlp(X), _F(_C()), dt)
-                assert_correct_bnb(mlp.up_proj, dt)
-                assert_correct_bnb(mlp.gate_proj, dt)
-                assert_correct_bnb(mlp.down_proj, dt)
-                # Also check dequantization output against Unsloth's reference
-                a, b, c = mlp_dequantize(X, mlp, dequantize_fx)
-                A, B, C = mlp_dequantize(X, mlp, unsloth_dequantize)
-                assert_same(a, A, _F(_C()), dt)
-                assert_same(b, B, _F(_C()), dt)
-                assert_same(c, C, _F(_C()), dt)
+            assert_same(mlp_forward(X, mlp, dequantize_fx), mlp(X), _F(_C()), dt)
+            assert_correct_bnb(mlp.up_proj, dt)
+            assert_correct_bnb(mlp.gate_proj, dt)
+            assert_correct_bnb(mlp.down_proj, dt)
+            # Also check dequantization output against Unsloth's reference
+            a, b, c = mlp_dequantize(X, mlp, dequantize_fx)
+            A, B, C = mlp_dequantize(X, mlp, unsloth_dequantize)
+            assert_same(a, A, _F(_C()), dt)
+            assert_same(b, B, _F(_C()), dt)
+            assert_same(c, C, _F(_C()), dt)
 
         # Benchmarking: Time the dequantization function over iterations
-        # Ensure GPU is in maximum performance mode
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()  # Clear any cached memory
-
-        # Set environment variables for maximum performance
-        if is_triton:
-            # Force using the fast kernel for all matrices
-            os.environ['NF4_FORCE_FAST_KERNEL'] = "1"
-            # Skip all verification for maximum performance
-            os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"
-            # Use larger block size for better memory bandwidth
-            os.environ['NF4_BLOCK_SIZE'] = "128"
-            # Use 2D grid for better parallelism
-            os.environ['NF4_USE_2D_GRID'] = "1"
-            # Use more aggressive optimizations for benchmark matrices
-            os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
-            # Use direct kernel launch for benchmark matrices
-            os.environ['NF4_DIRECT_KERNEL'] = "1"
-
-        # Set CUDA device to maximum performance mode
-        with torch.cuda.device(0):
-            # Disable auto-tuning to ensure consistent performance
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.deterministic = False
-            torch.backends.cuda.matmul.allow_tf32 = True
-
-            # Skip setting GPU performance mode as it requires root permissions
-            # This avoids permission errors in environments where we don't have admin rights
-
-            # Create highest-priority stream for benchmarking
-            stream = torch.cuda.Stream(priority=-1)
-
-            # For more accurate timing, run multiple iterations
-            # Use torch.cuda.Event for more precise GPU timing
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-
-            # Perform multiple warmup iterations to ensure everything is ready
-            # This helps ensure the GPU is fully warmed up and clocked to maximum frequency
-            for _ in range(5):  # More warmup iterations
-                with torch.cuda.stream(stream):
-                    mlp_dequantize(X, mlp, dequantize_fx)
-                torch.cuda.synchronize()
-
-            # Start timing
-            start_event.record(stream)
-
-            # Run benchmark iterations on high-priority stream
-            with torch.cuda.stream(stream):
-                for _ in range(iterations): 
-                    mlp_dequantize(X, mlp, dequantize_fx)
-
-            # End timing
-            end_event.record(stream)
-
-            # Wait for all GPU operations to complete
-            torch.cuda.synchronize()
-
-            # Calculate elapsed time in seconds
-            case_elapsed = start_event.elapsed_time(end_event) / 1000.0
+        start = time.time()
+        for _ in range(iterations): 
+            mlp_dequantize(X, mlp, dequantize_fx)
+        torch.cuda.synchronize()
+        case_elapsed = time.time() - start
 
         results.append((hd, m, dt, case_elapsed))
         elapsed += case_elapsed
@@ -361,62 +178,8 @@ def run_benchmarks(iterations=1000, warmup=2):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Set CUDA device to maximum performance mode
-    if torch.cuda.is_available():
-        # Set device to maximum performance mode
-        with torch.cuda.device(0):
-            torch.cuda.set_device(0)
-            # Set stream priority to high
-            stream = torch.cuda.Stream(priority=-1)  # High priority
-            torch.cuda.current_stream().wait_stream(stream)
-            with torch.cuda.stream(stream):
-                # Warm up the GPU
-                dummy = torch.ones(1, device='cuda')
-                dummy = dummy + dummy
-                torch.cuda.synchronize()
-
     # Clear CUDA cache before benchmarking
     torch.cuda.empty_cache()
-
-    # Set environment variables for optimal performance
-    # Force using Triton even if verification fails
-    os.environ['NF4_FORCE_TRITON'] = "1"
-    # Disable verification in benchmark mode
-    os.environ['NF4_ALWAYS_VERIFY'] = "0"
-    # Disable debug mode in benchmark mode
-    os.environ['NF4_DEBUG'] = "0"
-    # Disable debug output to reduce console spam
-    os.environ['NF4_DEBUG_OUTPUT'] = "0"
-    # Completely skip verification for maximum performance
-    os.environ['NF4_SKIP_VERIFICATION'] = "1"
-    # Use fastest possible parameters for maximum performance
-    os.environ['NF4_FASTEST_PARAMS'] = "1"
-    # Set known good scale factors for benchmark matrices
-    os.environ['NF4_SCALE_8192X2048_FLOAT16'] = "255.0"
-    os.environ['NF4_SCALE_14336X4096_BFLOAT16'] = "255.0"
-    os.environ['NF4_SCALE_4096X1024_BFLOAT16'] = "255.0"
-    # Set default absmax8 scale to 255.0
-    os.environ['NF4_ABSMAX8_SCALE'] = "255.0"
-
-    # Additional optimizations for benchmark mode
-    # Use 2D grid for better parallelism
-    os.environ['NF4_USE_2D_GRID'] = "1"
-    # Use larger block size for better memory bandwidth
-    os.environ['NF4_BLOCK_SIZE'] = "128"
-    # Use more aggressive optimizations for benchmark matrices
-    os.environ['NF4_OPTIMIZE_BENCHMARK'] = "1"
-    # Force using the fast kernel for all matrices
-    os.environ['NF4_FORCE_FAST_KERNEL'] = "1"
-    # Skip all verification steps
-    os.environ['NF4_SKIP_ALL_VERIFICATION'] = "1"
-    # Use direct kernel launch for benchmark matrices
-    os.environ['NF4_DIRECT_KERNEL'] = "1"
-    # Force using Triton even if verification fails
-    os.environ['NF4_FORCE_TRITON'] = "1"
-    # Disable debug output to reduce overhead
-    os.environ['NF4_DEBUG_OUTPUT'] = "0"
-    # Disable debug mode to reduce overhead
-    os.environ['NF4_DEBUG'] = "0"
 
     unsloth_time, unsloth_results = test_dequantize(
         unsloth_dequantize, name="Unsloth", 
@@ -429,10 +192,8 @@ def run_benchmarks(iterations=1000, warmup=2):
     )
 
     # Use the direct benchmark dequantization function for maximum performance
-    # This bypasses the optimized_triton_dequantize_nf4 wrapper and calls benchmark_fast_dequantize directly
-    # The test_dequantize function will reset the state automatically
     triton_time, triton_results = test_dequantize(
-        direct_benchmark_dequantize, name="Triton (Direct Benchmark)", 
+        direct_benchmark_dequantize, name="Triton", 
         iterations=iterations, warmup=warmup
     )
 
@@ -463,7 +224,7 @@ def run_benchmarks(iterations=1000, warmup=2):
 
 def plot_benchmarks(results):
     """Plots the benchmark results (time and speedup)."""
-    methods = ['Unsloth', 'PEFT', 'Triton (Direct Benchmark)']
+    methods = ['Unsloth', 'PEFT', 'Triton']
     sizes = []
     timings = [[], [], []] # Timings for [Unsloth, PEFT, Triton]
     speedups = [] # Triton speedup vs Unsloth
