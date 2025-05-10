@@ -1,162 +1,123 @@
 import torch
 import triton
 import triton.language as tl
-import os
 from unsloth.kernels.utils import fast_dequantize
 
 @triton.jit
-def _nf4_dequant_kernel(
+def _dequant_nf4_kernel(
     weight_ptr,      # Packed NF4 weights (uint8)
-    code_ptr,        # NF4 codebook values
-    absmax8_ptr,     # 8-bit absmax values (uint8)
-    absmax32_ptr,    # 32-bit absmax values (float32)
+    code_ptr,        # NF4 codebook values (float32)
+    absmax_ptr,      # absmax values (uint8)
+    absmax32_ptr,    # absmax32 values (float32)
     output_ptr,      # Output tensor
-    rows,            # Number of rows in weight matrix
-    cols,            # Number of columns in weight matrix
-    blocksize,       # Block size for 8-bit absmax (typically 64)
-    absmax8_scale: tl.constexpr,  # Scale factor for absmax8 conversion
-    BLOCK_SIZE: tl.constexpr  # Block size for processing
+    n_elements,      # Total elements
+    blocksize,       # Block size (typically 64)
+    BLOCK_SIZE: tl.constexpr,
 ):
-    # Calculate program ID and grid dimensions
+    """Simple kernel for NF4 dequantization based directly on Unsloth's implementation."""
+    # Calculate thread index
     pid = tl.program_id(0)
-    n_blocks_per_row = (cols + BLOCK_SIZE - 1) // BLOCK_SIZE
-    row_idx = pid // n_blocks_per_row
-    col_block_idx = pid % n_blocks_per_row
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
     
-    # Early exit if out of bounds
-    if row_idx >= rows:
-        return
-        
-    # Calculate column offsets
-    col_start = col_block_idx * BLOCK_SIZE
-    col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-    col_mask = col_offsets < cols
+    # Calculate indices for the packed weights (2 nibbles per byte)
+    byte_idx = offsets // 2
+    is_high = (offsets % 2) == 1  # Whether to use high or low nibble
     
-    # Calculate element indices and byte indices
-    row_offset = row_idx * cols
-    element_indices = row_offset + col_offsets
-    byte_indices = element_indices >> 1  # Divide by 2
-    
-    # Check which elements use high or low nibble
-    is_high_nibble = (element_indices & 1) != 0
-    
-    # Mask for valid byte indices
-    total_bytes = (rows * cols + 1) // 2
-    byte_mask = col_mask & (byte_indices < total_bytes)
-    
-    # Load packed bytes
-    packed_bytes = tl.load(weight_ptr + byte_indices, mask=byte_mask, other=0)
+    # Load the packed bytes
+    bytes_loaded = tl.load(weight_ptr + byte_idx, mask=mask & (byte_idx < (n_elements + 1) // 2))
     
     # Extract high and low nibbles
-    high_nibbles = (packed_bytes >> 4) & 0x0F
-    low_nibbles = packed_bytes & 0x0F
-    nibbles = tl.where(is_high_nibble, high_nibbles, low_nibbles)
+    low_nibbles = bytes_loaded & 0xF
+    high_nibbles = (bytes_loaded >> 4) & 0xF
+    nibbles = tl.where(is_high, high_nibbles, low_nibbles)
     
-    # Calculate absmax block indices
-    blocks_per_row = (cols + blocksize - 1) // blocksize
-    row_blocks_offset = row_idx * blocks_per_row
+    # Load the code values for each nibble
+    code_values = tl.load(code_ptr + nibbles, mask=mask)
     
-    # Use bit shift for power-of-2 blocksizes, division otherwise
-    if blocksize == 64:
-        absmax8_indices = row_blocks_offset + (col_offsets >> 6)
-    elif blocksize == 32:
-        absmax8_indices = row_blocks_offset + (col_offsets >> 5)
-    elif blocksize == 128:
-        absmax8_indices = row_blocks_offset + (col_offsets >> 7)
-    else:
-        absmax8_indices = row_blocks_offset + (col_offsets // blocksize)
+    # Calculate absmax indices and load values
+    absmax_idx = offsets // blocksize
+    absmax_values = tl.load(absmax_ptr + absmax_idx, mask=mask)
+    absmax32_values = tl.load(absmax32_ptr + absmax_idx, mask=mask)
     
-    # Create masks for valid indices
-    total_absmax_blocks = rows * blocks_per_row
-    absmax_mask = col_mask & (absmax8_indices < total_absmax_blocks)
-    nibble_mask = col_mask & (nibbles < 16)
+    # Convert absmax to float and scale
+    absmax_float = absmax_values.to(tl.float32)
+    scale = (absmax_float / 127.0) * absmax32_values
     
-    # Load code values (the lookup table for NF4 values)
-    code_values = tl.load(code_ptr + nibbles, mask=nibble_mask, other=0.0)
+    # Apply scaling
+    output = code_values * scale
     
-    # Load absmax values
-    absmax8_values = tl.load(absmax8_ptr + absmax8_indices, mask=absmax_mask, other=0)
-    absmax32_values = tl.load(absmax32_ptr + absmax8_indices, mask=absmax_mask, other=1.0)
-    
-    # Convert uint8 to float32 and apply scaling
-    absmax8_float = absmax8_values.to(tl.float32)
-    scale_factor = (absmax8_float / absmax8_scale) * absmax32_values
-    
-    # Apply scaling to each element
-    dequantized = code_values * scale_factor
-    
-    # Combine masks and store results
-    combined_mask = nibble_mask & absmax_mask & byte_mask
-    tl.store(output_ptr + element_indices, dequantized, mask=combined_mask)
+    # Store the result
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 def triton_dequantize_nf4(module):
     """
-    Dequantize NF4 weights using a Triton kernel.
+    Dequantize NF4 weights using Triton.
     
-    This function combines the double-dequant of absmax and weight lookup
-    into a single efficient Triton kernel. It's optimized for Tesla T4 GPUs
-    and designed to be faster than Unsloth's fast_dequantize implementation.
+    Args:
+        module: The Linear4bit module to dequantize
+        
+    Returns:
+        The dequantized weight tensor
     """
-    # Get module information
-    device = module.weight.device
-    weight = module.weight.data.contiguous()
-    quant_state = module.weight.quant_state
-    
-    # Extract dimensions
-    rows = module.out_features
-    cols = module.in_features
-    
-    # Get required data from quant_state
-    absmax8 = quant_state.absmax.contiguous()
-    codes = quant_state.code.contiguous()
-    absmax32 = quant_state.state2.absmax.contiguous()
-    
-    # Target dtype from quant_state
-    target_dtype = quant_state.dtype
-    
-    # Get blocksize (typically 64)
-    blocksize = quant_state.blocksize if hasattr(quant_state, 'blocksize') else 64
-    
-    # Reshape absmax8 for proper indexing
-    abs8_blocks_per_row = (cols + blocksize - 1) // blocksize
-    if absmax8.dim() == 1:
-        if absmax8.numel() == rows * abs8_blocks_per_row:
-            absmax8 = absmax8.view(rows, abs8_blocks_per_row)
-        else:
-            absmax8 = absmax8.expand(rows, -1) if absmax8.numel() == abs8_blocks_per_row else absmax8.repeat(rows, 1)
-    
-    # Flatten tensors for kernel
-    absmax8_flat = absmax8.contiguous().view(-1)
-    absmax32_flat = absmax32.to(torch.float32).contiguous().view(-1)
-    weight_flat = weight.contiguous().view(-1)
-    
-    # Create output tensor
-    output = torch.empty((rows, cols), dtype=target_dtype, device=device)
-    output_flat = output.view(-1)
-    
-    # Set kernel parameters
-    block_size = 64  # Optimal for T4
-    grid = (triton.cdiv(rows * cols, block_size),)
-    absmax8_scale = 127.0  # Optimal scale factor
-    
     try:
+        # Get necessary tensors
+        weight = module.weight.data
+        quant_state = module.weight.quant_state
+        codes = quant_state.code  # (16,) lookup table
+        absmax = quant_state.absmax  # (n_blocks,) uint8 tensor
+        absmax32 = quant_state.state2.absmax  # (n_blocks//4,) float32 tensor
+        
+        # Get dimensions
+        rows = module.out_features
+        cols = module.in_features
+        n_elements = rows * cols
+        
+        # Get blocksize
+        blocksize = quant_state.blocksize if hasattr(quant_state, 'blocksize') else 64
+        
+        # Ensure all tensors are contiguous
+        weight_flat = weight.contiguous().view(-1)
+        codes = codes.contiguous()
+        absmax = absmax.contiguous()
+        absmax32 = absmax32.contiguous()
+        
+        # Match the absmax and absmax32 arrangements with Unsloth
+        if absmax.numel() != (n_elements + blocksize - 1) // blocksize:
+            absmax = absmax.repeat(rows)
+        
+        # Create output tensor
+        output = torch.empty(n_elements, dtype=quant_state.dtype, device=weight.device)
+        
+        # Set kernel parameters
+        BLOCK_SIZE = 1024
+        n_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+        
         # Launch kernel
-        _nf4_dequant_kernel[grid](
+        _dequant_nf4_kernel[(n_blocks,)](
             weight_flat,
             codes,
-            absmax8_flat,
-            absmax32_flat,
-            output_flat,
-            rows,
-            cols,
+            absmax,
+            absmax32,
+            output,
+            n_elements,
             blocksize,
-            absmax8_scale=absmax8_scale,
-            BLOCK_SIZE=block_size,
+            BLOCK_SIZE=BLOCK_SIZE,
         )
+        
+        # Reshape output to match the original weight shape
+        output = output.view(rows, cols)
+        
+        # Verify the output has no NaN values
+        if torch.isnan(output).any():
+            # Fall back to Unsloth's implementation
+            return fast_dequantize(module.weight, module.weight.quant_state)
+            
         return output
     except Exception as e:
-        # Fall back to reference implementation if anything fails
-        print(f"Error in Triton kernel: {e}. Falling back to reference.")
+        # Fall back to Unsloth's implementation
+        print(f"Triton kernel failed: {e}. Using reference implementation.")
         return fast_dequantize(module.weight, module.weight.quant_state)
 
 def reset_triton_dequantize_state():
