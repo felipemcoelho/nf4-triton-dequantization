@@ -3,6 +3,16 @@ import triton
 import triton.language as tl
 from unsloth.kernels.utils import fast_dequantize
 
+@triton.autotune(
+    configs=[
+        triton.Config({'AUTOTUNE_BLOCK_SIZE': 64}, num_warps=2),
+        triton.Config({'AUTOTUNE_BLOCK_SIZE': 128}, num_warps=4),
+        triton.Config({'AUTOTUNE_BLOCK_SIZE': 256}, num_warps=8),
+        triton.Config({'AUTOTUNE_BLOCK_SIZE': 512}, num_warps=16),
+        triton.Config({'AUTOTUNE_BLOCK_SIZE': 1024}, num_warps=32),
+    ],
+    key=['n_elements', 'rows', 'cols', 'blocksize_cfg'],
+)
 @triton.jit
 def _dequantize_nf4_kernel_full(
     qweight_ptr,        # Flattened packed NF4 weights (uint8)
@@ -16,11 +26,11 @@ def _dequantize_nf4_kernel_full(
     blocksize_cfg,      # Configured blocksize (e.g., 64)
     n_blocks_per_row_cfg, # Number of blocks per row
     n_absmax32_groups_per_row_cfg, # Number of absmax32 groups per row
-    N_ELEMENTS_PER_THREAD_BLOCK: tl.constexpr, # Elements processed by each Triton program instance
+    AUTOTUNE_BLOCK_SIZE: tl.constexpr, # Elements processed by each Triton program instance (tuned)
 ):
     pid = tl.program_id(0)
-    base_offset = pid * N_ELEMENTS_PER_THREAD_BLOCK
-    element_offsets = base_offset + tl.arange(0, N_ELEMENTS_PER_THREAD_BLOCK)
+    base_offset = pid * AUTOTUNE_BLOCK_SIZE
+    element_offsets = base_offset + tl.arange(0, AUTOTUNE_BLOCK_SIZE)
     element_mask = element_offsets < n_elements
 
     current_row = element_offsets // cols
@@ -116,8 +126,8 @@ def triton_dequantize_nf4(module):
 
     output_tensor = torch.empty(n_elements, dtype=target_dtype, device=device)
 
-    KERNEL_ELEMENT_BLOCK_SIZE = 512
-    grid = (triton.cdiv(n_elements, KERNEL_ELEMENT_BLOCK_SIZE),)
+    # Grid is now a lambda function for the autotuner
+    grid = lambda META: (triton.cdiv(n_elements, META['AUTOTUNE_BLOCK_SIZE']),)
     
     try:
         _dequantize_nf4_kernel_full[grid](
@@ -129,12 +139,13 @@ def triton_dequantize_nf4(module):
             n_elements,
             out_features,
             in_features,
-            blocksize, # Renamed from blocksize_cfg in kernel for clarity
-            n_blocks_per_row, # Pass n_blocks_per_row_cfg
-            n_absmax32_groups_per_row, # Pass n_absmax32_groups_per_row_cfg
-            N_ELEMENTS_PER_THREAD_BLOCK=KERNEL_ELEMENT_BLOCK_SIZE,
+            blocksize, 
+            n_blocks_per_row,
+            n_absmax32_groups_per_row,
+            # AUTOTUNE_BLOCK_SIZE is passed by the autotuner
         )
     except Exception as e:
+        # Consider logging the exception e for debugging
         return fast_dequantize(weight_tensor, quant_state) # Fallback
 
     output_reshaped = output_tensor.view(out_features, in_features)
