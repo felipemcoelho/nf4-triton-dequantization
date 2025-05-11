@@ -13,6 +13,7 @@ import os
 import inspect
 from inspect import currentframe as _C, getframeinfo
 from nf4_triton_dequantization import triton_dequantize_nf4, optimized_triton_dequantize_nf4, reset_triton_dequantize_state, benchmark_fast_dequantize
+from nf4_triton_dequantization.dequantization import _dequantize_nf4_kernel_full
 import math
 
 # Helper for line numbers in asserts
@@ -203,6 +204,12 @@ def run_benchmarks(iterations=1000, warmup=2):
         direct_benchmark_dequantize, name="Triton", 
         iterations=iterations, warmup=warmup
     )
+
+    # Print the best config found by the autotuner for the Triton kernel
+    if hasattr(_dequantize_nf4_kernel_full, 'best_config'):
+        print(f"Autotuner final best_config for _dequantize_nf4_kernel_full: {_dequantize_nf4_kernel_full.best_config}")
+    else:
+        print("Autotuner did not set a best_config on _dequantize_nf4_kernel_full.")
 
     # Calculate speedups relative to Triton
     unsloth_speedup = unsloth_time / triton_time

@@ -151,9 +151,6 @@ def triton_dequantize_nf4(module):
             n_absmax32_groups_per_row,
             # AUTOTUNE_BLOCK_SIZE is passed by the autotuner
         )
-        # Print the best config found by the autotuner
-        if hasattr(_dequantize_nf4_kernel_full, 'best_config'):
-            print(f"Autotuner best config for _dequantize_nf4_kernel_full: {_dequantize_nf4_kernel_full.best_config}")
 
     except Exception as e:
         print(f"Triton kernel execution failed: {e}") # Print the exception
