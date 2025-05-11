@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from unsloth.kernels.utils import fast_dequantize
 
-@triton.jit
+@triton.jit(num_warps=8)
 def _dequantize_nf4_kernel_full(
     qweight_ptr,        # Flattened packed NF4 weights (uint8)
     code_ptr,           # NF4 codebook values (float32)
@@ -16,7 +16,7 @@ def _dequantize_nf4_kernel_full(
     blocksize_cfg,      # Configured blocksize (e.g., 64)
     n_blocks_per_row_cfg, # Number of blocks per row
     n_absmax32_groups_per_row_cfg, # Number of absmax32 groups per row
-    N_ELEMENTS_PER_THREAD_BLOCK: tl.constexpr, # Elements processed by each Triton block
+    N_ELEMENTS_PER_THREAD_BLOCK: tl.constexpr, # Elements processed by each Triton program instance
 ):
     pid = tl.program_id(0)
     base_offset = pid * N_ELEMENTS_PER_THREAD_BLOCK
@@ -116,7 +116,7 @@ def triton_dequantize_nf4(module):
 
     output_tensor = torch.empty(n_elements, dtype=target_dtype, device=device)
 
-    KERNEL_ELEMENT_BLOCK_SIZE = 1024 
+    KERNEL_ELEMENT_BLOCK_SIZE = 256
     grid = (triton.cdiv(n_elements, KERNEL_ELEMENT_BLOCK_SIZE),)
     
     try:
