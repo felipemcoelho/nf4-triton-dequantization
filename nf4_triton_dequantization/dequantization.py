@@ -126,6 +126,13 @@ def triton_dequantize_nf4(module):
 
     output_tensor = torch.empty(n_elements, dtype=target_dtype, device=device)
 
+    # Clear Triton caches to force autotuning
+    if hasattr(triton, 'runtime') and hasattr(triton.runtime, 'autotuner'):
+        if hasattr(triton.runtime.autotuner, 'AUTOTUNER_CACHE'):
+            triton.runtime.autotuner.AUTOTUNER_CACHE.clear()
+        if hasattr(triton.runtime.autotuner, 'JIT_CACHE'):
+            triton.runtime.autotuner.JIT_CACHE.clear()
+
     # Grid is now a lambda function for the autotuner
     grid = lambda META: (triton.cdiv(n_elements, META['AUTOTUNE_BLOCK_SIZE']),)
     
@@ -144,8 +151,12 @@ def triton_dequantize_nf4(module):
             n_absmax32_groups_per_row,
             # AUTOTUNE_BLOCK_SIZE is passed by the autotuner
         )
+        # Print the best config found by the autotuner
+        if hasattr(_dequantize_nf4_kernel_full, 'best_config'):
+            print(f"Autotuner best config for _dequantize_nf4_kernel_full: {_dequantize_nf4_kernel_full.best_config}")
+
     except Exception as e:
-        # Consider logging the exception e for debugging
+        print(f"Triton kernel execution failed: {e}") # Print the exception
         return fast_dequantize(weight_tensor, quant_state) # Fallback
 
     output_reshaped = output_tensor.view(out_features, in_features)
