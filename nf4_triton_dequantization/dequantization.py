@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from unsloth.kernels.utils import fast_dequantize
 
-@triton.jit(num_warps=8)
+@triton.jit
 def _dequantize_nf4_kernel_full(
     qweight_ptr,        # Flattened packed NF4 weights (uint8)
     code_ptr,           # NF4 codebook values (float32)
