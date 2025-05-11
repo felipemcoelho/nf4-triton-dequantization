@@ -116,7 +116,7 @@ def triton_dequantize_nf4(module):
 
     output_tensor = torch.empty(n_elements, dtype=target_dtype, device=device)
 
-    KERNEL_ELEMENT_BLOCK_SIZE = 256
+    KERNEL_ELEMENT_BLOCK_SIZE = 512
     grid = (triton.cdiv(n_elements, KERNEL_ELEMENT_BLOCK_SIZE),)
     
     try:
