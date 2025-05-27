@@ -170,4 +170,4 @@ def optimized_triton_dequantize_nf4(module):
     return triton_dequantize_nf4(module)
 
 def benchmark_fast_dequantize(module):
-    return triton_dequantize_nf4(module)
+    return fast_dequantize(module.weight, module.weight.quant_state)
