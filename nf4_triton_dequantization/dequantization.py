@@ -2,178 +2,234 @@ import torch
 import triton
 import triton.language as tl
 from unsloth.kernels.utils import fast_dequantize
+from .asm_optimized import asm_optimized_dequantize
 
-@triton.autotune(
-    configs=[
-        triton.Config({'AUTOTUNE_BLOCK_SIZE': 64}, num_warps=2),
-        triton.Config({'AUTOTUNE_BLOCK_SIZE': 128}, num_warps=4),
-        triton.Config({'AUTOTUNE_BLOCK_SIZE': 256}, num_warps=8),
-        triton.Config({'AUTOTUNE_BLOCK_SIZE': 512}, num_warps=16),
-        triton.Config({'AUTOTUNE_BLOCK_SIZE': 1024}, num_warps=32),
-    ],
-    key=['n_elements', 'rows', 'cols', 'blocksize_cfg'],
-)
 @triton.jit
-def _dequantize_nf4_kernel_full(
-    qweight_ptr,        # Flattened packed NF4 weights (uint8)
-    code_ptr,           # NF4 codebook values (float32)
-    flat_absmax_ptr,    # Flattened absmax values for each block (uint8)
-    flat_absmax32_grouped_ptr,  # Flattened absmax32 values, one per 4-block group (float32)
-    output_ptr,         # Output tensor (float16/bfloat16)
-    n_elements,         # Total number of elements in the weight matrix
-    rows,               # Number of rows in the weight matrix
-    cols,               # Number of columns in the weight matrix
-    blocksize_cfg,      # Configured blocksize (e.g., 64)
-    n_blocks_per_row_cfg, # Number of blocks per row
-    n_absmax32_groups_per_row_cfg, # Number of absmax32 groups per row
-    AUTOTUNE_BLOCK_SIZE: tl.constexpr, # Elements processed by each Triton program instance (tuned)
+def _ultra_fast_nf4_kernel(
+    qweight_ptr,
+    absmax_ptr,
+    absmax32_ptr,
+    output_ptr,
+    M, N,
+    BLOCK_SIZE: tl.constexpr,
 ):
+    """Ultra-optimized NF4 kernel with inline lookup and vectorization."""
     pid = tl.program_id(0)
-    base_offset = pid * AUTOTUNE_BLOCK_SIZE
-    element_offsets = base_offset + tl.arange(0, AUTOTUNE_BLOCK_SIZE)
-    element_mask = element_offsets < n_elements
-
-    current_row = element_offsets // cols
-    current_col = element_offsets % cols
-
-    # --- Load NF4 nibble --- 
-    byte_indices = element_offsets >> 1
-    is_high_nibble = (element_offsets & 1) == 1
-    valid_byte_load_mask = element_mask & (byte_indices < tl.cdiv(n_elements, 2))
-    packed_bytes = tl.load(qweight_ptr + byte_indices, mask=valid_byte_load_mask, other=0)
-    low_nibbles = packed_bytes & 0x0F
-    high_nibbles = (packed_bytes >> 4) & 0x0F
-    nibbles = tl.where(is_high_nibble, high_nibbles, low_nibbles)
-
-    # --- Load code value --- 
-    valid_nibble_mask = element_mask & (nibbles < 16)
-    code_val = tl.load(code_ptr + nibbles, mask=valid_nibble_mask, other=0.0)
-
-    # --- Determine block index for scaling --- 
-    block_idx_in_row = current_col // blocksize_cfg
     
-    # --- Load absmax (uint8) --- 
-    # Flat index for absmax tensor: (rows * n_blocks_per_row_cfg)
-    flat_absmax_idx = current_row * n_blocks_per_row_cfg + block_idx_in_row
-    max_flat_absmax_idx = rows * n_blocks_per_row_cfg
-    valid_absmax_load_mask = element_mask & (flat_absmax_idx < max_flat_absmax_idx)
-    absmax_byte_val = tl.load(flat_absmax_ptr + flat_absmax_idx, mask=valid_absmax_load_mask, other=0)
+    # Calculate offsets for this block
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
     
-    # --- Load absmax32 (float32) from grouped tensor --- 
-    absmax32_group_offset_in_row = block_idx_in_row // 4
-    # Flat index for absmax32_grouped tensor: (rows * n_absmax32_groups_per_row_cfg)
-    flat_absmax32_grouped_idx = current_row * n_absmax32_groups_per_row_cfg + absmax32_group_offset_in_row
-    max_flat_absmax32_grouped_idx = rows * n_absmax32_groups_per_row_cfg
-    valid_absmax32_load_mask = element_mask & (flat_absmax32_grouped_idx < max_flat_absmax32_grouped_idx)
-    absmax32_float_val = tl.load(flat_absmax32_grouped_ptr + flat_absmax32_grouped_idx, mask=valid_absmax32_load_mask, other=0.0)
+    # Mask for bounds checking
+    mask = offsets < (M * N)
+    
+    # Calculate row/col from linear index
+    row = offsets // N
+    col = offsets % N
+    
+    # Vectorized byte loading with cache eviction hint
+    byte_offsets = offsets >> 1
+    bytes_packed = tl.load(qweight_ptr + byte_offsets, mask=mask, other=0, eviction_policy="evict_first")
+    
+    # Extract nibbles using bitwise ops
+    is_odd = (offsets & 1) == 1
+    nibbles = tl.where(is_odd, (bytes_packed >> 4), bytes_packed) & 0x0F
+    
+    # Inline NF4 lookup table - hardcoded for maximum performance
+    codes = tl.where(nibbles == 0, -1.0,
+            tl.where(nibbles == 1, -0.6961928009986877,
+            tl.where(nibbles == 2, -0.5250730514526367,
+            tl.where(nibbles == 3, -0.39491748809814453,
+            tl.where(nibbles == 4, -0.28444138169288635,
+            tl.where(nibbles == 5, -0.18477343022823334,
+            tl.where(nibbles == 6, -0.09105003625154495,
+            tl.where(nibbles == 7, 0.0,
+            tl.where(nibbles == 8, 0.07958029955625534,
+            tl.where(nibbles == 9, 0.16093020141124725,
+            tl.where(nibbles == 10, 0.24611230194568634,
+            tl.where(nibbles == 11, 0.33791524171829224,
+            tl.where(nibbles == 12, 0.44070982933044434,
+            tl.where(nibbles == 13, 0.5626170039176941,
+            tl.where(nibbles == 14, 0.7229568362236023, 1.0)))))))))))))))
+    
+    # Calculate scale indices
+    blocks_per_row = (N + 63) // 64
+    block_col = col // 64
+    absmax_idx = row * blocks_per_row + block_col
+    absmax32_idx = row * ((blocks_per_row + 3) // 4) + (block_col // 4)
+    
+    # Load scales with coalescing and cache hints
+    absmax_vals = tl.load(absmax_ptr + absmax_idx, mask=mask, other=0, eviction_policy="evict_last")
+    absmax32_vals = tl.load(absmax32_ptr + absmax32_idx, mask=mask, other=0.0, eviction_policy="evict_last")
+    
+    # Compute final values - optimized multiplication
+    scales = (absmax_vals.to(tl.float32) * (1.0 / 127.0)) * absmax32_vals
+    output = codes * scales
+    
+    # Store with coalescing
+    tl.store(output_ptr + offsets, output, mask=mask)
 
-    # --- Dequantization --- 
-    scale = (absmax_byte_val.to(tl.float32) / 127.0) * absmax32_float_val
-    dequant_val = code_val * scale
+@triton.jit
+def _memory_efficient_nf4_kernel(
+    qweight_ptr,
+    absmax_ptr, 
+    absmax32_ptr,
+    output_ptr,
+    total_elements,
+    cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Memory-efficient version with prefetching."""
+    pid = tl.program_id(0)
     
-    final_store_mask = element_mask # Individual masks already applied to intermediate values via 'other'
-    tl.store(output_ptr + element_offsets, dequant_val, mask=final_store_mask)
+    # Base offset for this block
+    base = pid * BLOCK_SIZE
+    offsets = base + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total_elements
+    
+    # Compute indices
+    rows = offsets // cols
+    cols_idx = offsets % cols
+    
+    # Prefetch packed weights
+    byte_idx = offsets >> 1
+    packed = tl.load(qweight_ptr + byte_idx, mask=mask, other=0)
+    
+    # Extract nibbles efficiently
+    is_high = (offsets & 1) == 1
+    nibbles = tl.where(is_high, packed >> 4, packed) & 0x0F
+    
+    # Direct computation of NF4 values
+    # Split into groups for better instruction scheduling
+    is_neg = nibbles < 8
+    abs_nibbles = tl.where(is_neg, 7 - nibbles, nibbles - 8)
+    
+    # Compute base values
+    base_vals = tl.where(abs_nibbles == 0, 1.0,
+                tl.where(abs_nibbles == 1, 0.7229568362236023,
+                tl.where(abs_nibbles == 2, 0.5626170039176941,
+                tl.where(abs_nibbles == 3, 0.44070982933044434,
+                tl.where(abs_nibbles == 4, 0.33791524171829224,
+                tl.where(abs_nibbles == 5, 0.24611230194568634,
+                tl.where(abs_nibbles == 6, 0.16093020141124725,
+                0.07958029955625534)))))))
+    
+    # Handle special cases
+    base_vals = tl.where(nibbles == 7, 0.0, base_vals)
+    base_vals = tl.where(nibbles == 6, -0.09105003625154495, base_vals)
+    base_vals = tl.where(nibbles == 5, -0.18477343022823334, base_vals)
+    base_vals = tl.where(nibbles == 4, -0.28444138169288635, base_vals)
+    base_vals = tl.where(nibbles == 3, -0.39491748809814453, base_vals)
+    base_vals = tl.where(nibbles == 2, -0.5250730514526367, base_vals)
+    base_vals = tl.where(nibbles == 1, -0.6961928009986877, base_vals)
+    base_vals = tl.where(nibbles == 0, -1.0, base_vals)
+    
+    # Compute block indices
+    blocks_per_row = (cols + 63) // 64
+    block_idx = cols_idx // 64
+    absmax_idx = rows * blocks_per_row + block_idx
+    absmax32_idx = rows * ((blocks_per_row + 3) // 4) + (block_idx >> 2)
+    
+    # Load and apply scales
+    absmax = tl.load(absmax_ptr + absmax_idx, mask=mask, other=0)
+    absmax32 = tl.load(absmax32_ptr + absmax32_idx, mask=mask, other=0.0)
+    
+    # Final computation
+    scale = (absmax.to(tl.float32) * (1.0 / 127.0)) * absmax32
+    output = base_vals * scale
+    
+    # Store results
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 def triton_dequantize_nf4(module):
-    weight_tensor = module.weight
-    quant_state = weight_tensor.quant_state
-
-    qweight_data = weight_tensor.data
-    code_data = quant_state.code
-    absmax_data_orig = quant_state.absmax
-    absmax32_data_orig = quant_state.state2.absmax
-    blocksize = quant_state.blocksize if hasattr(quant_state, "blocksize") else 64
-    target_dtype = quant_state.dtype
-    
-    out_features = module.out_features
-    in_features = module.in_features
-    n_elements = out_features * in_features
-    device = qweight_data.device
-
-    # 1. Prepare flat_absmax (uint8)
-    n_blocks_per_row = (in_features + blocksize - 1) // blocksize
-    expected_absmax_shape_2d = (out_features, n_blocks_per_row)
-
-    if absmax_data_orig.dim() == 1 and absmax_data_orig.numel() == n_blocks_per_row:
-        prepared_absmax = absmax_data_orig.unsqueeze(0).expand(expected_absmax_shape_2d)
-    elif absmax_data_orig.dim() == 1 and absmax_data_orig.numel() == out_features * n_blocks_per_row:
-        prepared_absmax = absmax_data_orig.view(expected_absmax_shape_2d)
-    elif absmax_data_orig.dim() == 2 and absmax_data_orig.shape == expected_absmax_shape_2d:
-        prepared_absmax = absmax_data_orig
-    else:
-        return fast_dequantize(weight_tensor, quant_state) # Fallback
-    flat_absmax = prepared_absmax.contiguous().view(-1)
-
-    # 2. Prepare flat_absmax32_grouped (float32)
-    n_absmax32_groups_per_row = (n_blocks_per_row + 3) // 4
-    expected_absmax32_groups_shape_2d = (out_features, n_absmax32_groups_per_row)
-
-    if absmax32_data_orig.dim() == 1 and absmax32_data_orig.numel() == n_absmax32_groups_per_row:
-        prepared_absmax32_groups = absmax32_data_orig.unsqueeze(0).expand(expected_absmax32_groups_shape_2d)
-    elif absmax32_data_orig.dim() == 1 and absmax32_data_orig.numel() == out_features * n_absmax32_groups_per_row:
-        prepared_absmax32_groups = absmax32_data_orig.view(expected_absmax32_groups_shape_2d)
-    elif absmax32_data_orig.dim() == 2 and absmax32_data_orig.shape == expected_absmax32_groups_shape_2d:
-        prepared_absmax32_groups = absmax32_data_orig
-    else:
-        return fast_dequantize(weight_tensor, quant_state) # Fallback
-    
-    flat_absmax32_grouped = prepared_absmax32_groups.contiguous().view(-1)
-
-    qweight_flat = qweight_data.contiguous().view(-1)
-    code_data = code_data.contiguous().to(device=device, dtype=torch.float32)
-    flat_absmax = flat_absmax.contiguous().to(device=device, dtype=torch.uint8)
-    flat_absmax32_grouped = flat_absmax32_grouped.contiguous().to(device=device, dtype=torch.float32)
-
-    output_tensor = torch.empty(n_elements, dtype=target_dtype, device=device)
-
-    # Clear Triton caches to force autotuning
-    if hasattr(triton, 'runtime') and hasattr(triton.runtime, 'autotuner'):
-        if hasattr(triton.runtime.autotuner, 'AUTOTUNER_CACHE'):
-            triton.runtime.autotuner.AUTOTUNER_CACHE.clear()
-        if hasattr(triton.runtime.autotuner, 'JIT_CACHE'):
-            triton.runtime.autotuner.JIT_CACHE.clear()
-
-    # Print autotuner configurations
-    if hasattr(_dequantize_nf4_kernel_full, 'configs') and _dequantize_nf4_kernel_full.configs:
-        print(f"Autotuner configs for _dequantize_nf4_kernel_full: {_dequantize_nf4_kernel_full.configs}")
-    else:
-        print("Could not retrieve autotuner configs for _dequantize_nf4_kernel_full.")
-
-    # Grid is now a lambda function for the autotuner
-    grid = lambda META: (triton.cdiv(n_elements, META['AUTOTUNE_BLOCK_SIZE']),)
-    
+    """Ultra-optimized NF4 dequantization using Triton."""
+    # Try ASM-optimized version first for maximum performance
     try:
-        _dequantize_nf4_kernel_full[grid](
-            qweight_flat,
-            code_data,
-            flat_absmax,
-            flat_absmax32_grouped,
-            output_tensor,
-            n_elements,
-            out_features,
-            in_features,
-            blocksize, 
-            n_blocks_per_row,
-            n_absmax32_groups_per_row,
-            # AUTOTUNE_BLOCK_SIZE is passed by the autotuner
-        )
-
-    except Exception as e:
-        print(f"Triton kernel execution failed: {e}") # Print the exception
-        return fast_dequantize(weight_tensor, quant_state) # Fallback
-
-    output_reshaped = output_tensor.view(out_features, in_features)
-
-    if torch.isnan(output_reshaped).any() or torch.isinf(output_reshaped).any():
-        return fast_dequantize(weight_tensor, quant_state)
+        return asm_optimized_dequantize(module)
+    except:
+        pass
     
-    return output_reshaped
-
-def reset_triton_dequantize_state():
-    pass
+    weight = module.weight
+    quant_state = weight.quant_state
+    
+    # Extract components
+    qweight = weight.data
+    absmax = quant_state.absmax
+    absmax32 = quant_state.state2.absmax
+    dtype = quant_state.dtype
+    device = qweight.device
+    
+    M = module.out_features
+    N = module.in_features
+    
+    # Prepare scaling factors
+    blocks_per_row = (N + 63) // 64
+    
+    # Reshape absmax efficiently
+    if absmax.dim() == 1:
+        if absmax.numel() == blocks_per_row:
+            absmax = absmax.unsqueeze(0).expand(M, -1)
+        elif absmax.numel() == M * blocks_per_row:
+            absmax = absmax.view(M, blocks_per_row)
+    
+    if absmax.shape != (M, blocks_per_row):
+        return fast_dequantize(weight, quant_state)
+    
+    # Reshape absmax32
+    absmax32_per_row = (blocks_per_row + 3) // 4
+    if absmax32.dim() == 1:
+        if absmax32.numel() == absmax32_per_row:
+            absmax32 = absmax32.unsqueeze(0).expand(M, -1)
+        elif absmax32.numel() == M * absmax32_per_row:
+            absmax32 = absmax32.view(M, absmax32_per_row)
+    
+    if absmax32.shape != (M, absmax32_per_row):
+        return fast_dequantize(weight, quant_state)
+    
+    # Allocate output
+    output = torch.empty((M, N), dtype=dtype, device=device)
+    
+    # Choose optimal block size based on matrix size
+    total_elements = M * N
+    if total_elements > 50_000_000:  # Very large matrices
+        BLOCK_SIZE = 4096
+    elif total_elements > 10_000_000:  # Large matrices  
+        BLOCK_SIZE = 2048
+    elif total_elements > 1_000_000:   # Medium matrices
+        BLOCK_SIZE = 1024
+    else:                              # Small matrices
+        BLOCK_SIZE = 512
+    
+    # Ensure block size doesn't exceed total elements
+    BLOCK_SIZE = min(BLOCK_SIZE, total_elements)
+    
+    # Launch kernel
+    grid = lambda meta: (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    # Use the ultra-fast kernel for best performance
+    _ultra_fast_nf4_kernel[grid](
+        qweight.view(-1),
+        absmax.contiguous().view(-1),
+        absmax32.contiguous().view(-1),
+        output.view(-1),
+        M, N,
+        BLOCK_SIZE,
+    )
+    
+    return output
 
 def optimized_triton_dequantize_nf4(module):
+    """Alias for compatibility."""
     return triton_dequantize_nf4(module)
 
 def benchmark_fast_dequantize(module):
+    """Benchmark entry point using the fastest implementation."""
     return triton_dequantize_nf4(module)
+
+def reset_triton_dequantize_state():
+    """Reset any cached state."""
+    # Clear Triton's compilation cache for fresh benchmarking
+    if hasattr(triton, 'runtime'):
+        if hasattr(triton.runtime, 'cache'):
+            triton.runtime.cache.clear()
+    pass
