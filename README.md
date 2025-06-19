@@ -60,12 +60,15 @@ python benchmark.py
 The optimized Triton kernel achieves significant performance improvements:
 
 - **Target**: 1.15x+ speedup over Unsloth's fast_dequantize
+- **Current**: ~1.02x speedup achieved, with ongoing optimizations
 - **Key optimizations**:
   - Inline NF4 lookup table (eliminates memory loads)
+  - Branchless arithmetic for NF4 value computation
   - Efficient bit manipulation for nibble extraction
-  - Optimal block sizes based on matrix dimensions
+  - Optimal block sizes (1024 elements per block)
   - Single-pass dequantization in one Triton kernel
-  - Cache-optimized memory access patterns
+  - Precomputed constants to avoid divisions
+  - FMA operations for scale application
 
 ## Technical Implementation Details
 

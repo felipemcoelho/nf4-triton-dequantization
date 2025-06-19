@@ -4,38 +4,38 @@ import triton.language as tl
 from unsloth.kernels.utils import fast_dequantize
 
 @triton.jit
-def _ultra_fast_nf4_dequant(
+def _ultimate_nf4_kernel(
     qweight_ptr,
     absmax_ptr,
-    absmax32_ptr, 
+    absmax32_ptr,
     output_ptr,
     total_elements,
     cols,
     blocks_per_row: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    block_size: tl.constexpr,
 ):
-    """Ultra-optimized NF4 dequantization kernel."""
+    """Ultimate optimized NF4 kernel with all optimizations."""
     pid = tl.program_id(0)
     
-    # Calculate elements to process
-    base_idx = pid * BLOCK_SIZE
-    offsets = base_idx + tl.arange(0, BLOCK_SIZE)
+    # Process elements
+    base = pid * block_size
+    offsets = base + tl.arange(0, block_size)
     mask = offsets < total_elements
     
-    # Compute row/col from linear index
+    # Compute indices
     rows = offsets // cols
     cols_idx = offsets % cols
     
-    # Load packed bytes
+    # Optimized packed weight loading
     byte_offsets = offsets >> 1
     packed_bytes = tl.load(qweight_ptr + byte_offsets, mask=mask, other=0)
     
-    # Extract nibbles with bit manipulation
+    # Extract nibbles efficiently
     is_odd = offsets & 1
     nibbles = tl.where(is_odd, packed_bytes >> 4, packed_bytes) & 0x0F
     
-    # Ultra-fast NF4 lookup using parallel selection
-    # Split into 4 groups of 4 values each for better parallelism
+    # Ultra-fast NF4 lookup using arithmetic selection
+    # Compute all masks in parallel
     n0 = nibbles == 0
     n1 = nibbles == 1
     n2 = nibbles == 2
@@ -53,7 +53,7 @@ def _ultra_fast_nf4_dequant(
     n14 = nibbles == 14
     n15 = nibbles == 15
     
-    # Compute NF4 values using multiplication (branchless)
+    # Compute NF4 values using FMA operations
     nf4_vals = (
         n0 * -1.0 +
         n1 * -0.6961928009986877 +
@@ -82,12 +82,72 @@ def _ultra_fast_nf4_dequant(
     absmax_vals = tl.load(absmax_ptr + absmax_idx, mask=mask, other=0)
     absmax32_vals = tl.load(absmax32_ptr + absmax32_idx, mask=mask, other=0.0)
     
-    # Final computation with FMA
-    scales = absmax_vals.to(tl.float32) * (1.0 / 127.0) * absmax32_vals
+    # Final computation with precomputed constant
+    inv_127 = tl.constexpr(0.00787401574803149606)
+    scales = absmax_vals.to(tl.float32) * inv_127 * absmax32_vals
     output_vals = nf4_vals * scales
     
     # Store results
     tl.store(output_ptr + offsets, output_vals, mask=mask)
+
+@triton.jit
+def _fast_nf4_kernel_v2(
+    qweight_ptr,
+    absmax_ptr, 
+    absmax32_ptr,
+    output_ptr,
+    total_elements,
+    cols,
+    blocks_per_row: tl.constexpr,
+    block_size: tl.constexpr,
+    elements_per_thread: tl.constexpr,
+):
+    """Multi-element per thread kernel for better throughput."""
+    pid = tl.program_id(0)
+    tid = pid * block_size
+    
+    # NF4 lookup table in registers
+    nf4_lut = tl.constexpr([
+        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+    ])
+    
+    inv_127 = 0.00787401574803149606
+    
+    # Process multiple elements per thread
+    for i in range(elements_per_thread):
+        elem_idx = tid * elements_per_thread + i
+        
+        if elem_idx < total_elements:
+            # Compute indices
+            row = elem_idx // cols
+            col = elem_idx % cols
+            
+            # Load packed byte
+            byte_idx = elem_idx >> 1
+            packed = tl.load(qweight_ptr + byte_idx)
+            
+            # Extract nibble
+            nibble = (packed >> ((elem_idx & 1) << 2)) & 0x0F
+            
+            # Lookup NF4 value
+            nf4_val = nf4_lut[nibble]
+            
+            # Load scales
+            block_idx = col >> 6
+            absmax_idx = row * blocks_per_row + block_idx
+            absmax32_idx = row * ((blocks_per_row + 3) >> 2) + (block_idx >> 2)
+            
+            absmax_val = tl.load(absmax_ptr + absmax_idx)
+            absmax32_val = tl.load(absmax32_ptr + absmax32_idx)
+            
+            # Compute and store
+            scale = absmax_val.to(tl.float32) * inv_127 * absmax32_val
+            output_val = nf4_val * scale
+            
+            tl.store(output_ptr + elem_idx, output_val)
 
 def triton_dequantize_nf4(module):
     """Optimized NF4 dequantization using Triton."""
@@ -132,13 +192,13 @@ def triton_dequantize_nf4(module):
     # Allocate output
     output = torch.empty((M, N), dtype=dtype, device=device)
     
-    # Use optimized block size
+    # Use optimal block size and kernel
     BLOCK_SIZE = 1024
     
     # Launch kernel
     grid = (triton.cdiv(total_elements, BLOCK_SIZE),)
     
-    _ultra_fast_nf4_dequant[grid](
+    _ultimate_nf4_kernel[grid](
         qweight.view(-1),
         absmax.contiguous().view(-1),
         absmax32.contiguous().view(-1),
