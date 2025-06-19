@@ -4,81 +4,93 @@ import triton.language as tl
 from unsloth.kernels.utils import fast_dequantize
 
 @triton.jit
-def _nf4_dequantize_kernel(
+def _ultra_fast_nf4_dequant(
     qweight_ptr,
     absmax_ptr,
-    absmax32_ptr,
+    absmax32_ptr, 
     output_ptr,
-    n_elements,
-    n_cols,
-    blocks_per_row,
+    total_elements,
+    cols,
+    blocks_per_row: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Ultra-optimized NF4 dequantization kernel."""
     pid = tl.program_id(0)
     
-    # Process BLOCK_SIZE elements per program
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    # Calculate elements to process
+    base_idx = pid * BLOCK_SIZE
+    offsets = base_idx + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total_elements
     
-    # Compute row/col indices
-    row = offsets // n_cols
-    col = offsets % n_cols
+    # Compute row/col from linear index
+    rows = offsets // cols
+    cols_idx = offsets % cols
     
-    # Load packed weights efficiently
-    byte_idx = offsets >> 1
-    packed = tl.load(qweight_ptr + byte_idx, mask=mask, other=0)
+    # Load packed bytes
+    byte_offsets = offsets >> 1
+    packed_bytes = tl.load(qweight_ptr + byte_offsets, mask=mask, other=0)
     
-    # Extract nibbles with optimized bit manipulation
+    # Extract nibbles with bit manipulation
     is_odd = offsets & 1
-    nibbles = (packed >> (is_odd << 2)) & 0x0F
+    nibbles = tl.where(is_odd, packed_bytes >> 4, packed_bytes) & 0x0F
     
-    # Inline NF4 lookup table for maximum performance
-    codes = (
-        tl.where(nibbles == 0, -1.0,
-        tl.where(nibbles == 1, -0.6961928009986877,
-        tl.where(nibbles == 2, -0.5250730514526367,
-        tl.where(nibbles == 3, -0.39491748809814453,
-        tl.where(nibbles == 4, -0.28444138169288635,
-        tl.where(nibbles == 5, -0.18477343022823334,
-        tl.where(nibbles == 6, -0.09105003625154495,
-        tl.where(nibbles == 7, 0.0,
-        tl.where(nibbles == 8, 0.07958029955625534,
-        tl.where(nibbles == 9, 0.16093020141124725,
-        tl.where(nibbles == 10, 0.24611230194568634,
-        tl.where(nibbles == 11, 0.33791524171829224,
-        tl.where(nibbles == 12, 0.44070982933044434,
-        tl.where(nibbles == 13, 0.5626170039176941,
-        tl.where(nibbles == 14, 0.7229568362236023, 
-        1.0)))))))))))))))
+    # Ultra-fast NF4 lookup using parallel selection
+    # Split into 4 groups of 4 values each for better parallelism
+    n0 = nibbles == 0
+    n1 = nibbles == 1
+    n2 = nibbles == 2
+    n3 = nibbles == 3
+    n4 = nibbles == 4
+    n5 = nibbles == 5
+    n6 = nibbles == 6
+    n7 = nibbles == 7
+    n8 = nibbles == 8
+    n9 = nibbles == 9
+    n10 = nibbles == 10
+    n11 = nibbles == 11
+    n12 = nibbles == 12
+    n13 = nibbles == 13
+    n14 = nibbles == 14
+    n15 = nibbles == 15
+    
+    # Compute NF4 values using multiplication (branchless)
+    nf4_vals = (
+        n0 * -1.0 +
+        n1 * -0.6961928009986877 +
+        n2 * -0.5250730514526367 +
+        n3 * -0.39491748809814453 +
+        n4 * -0.28444138169288635 +
+        n5 * -0.18477343022823334 +
+        n6 * -0.09105003625154495 +
+        n7 * 0.0 +
+        n8 * 0.07958029955625534 +
+        n9 * 0.16093020141124725 +
+        n10 * 0.24611230194568634 +
+        n11 * 0.33791524171829224 +
+        n12 * 0.44070982933044434 +
+        n13 * 0.5626170039176941 +
+        n14 * 0.7229568362236023 +
+        n15 * 1.0
     )
     
-    # Calculate scale indices efficiently
-    block_col = col >> 6
-    absmax_idx = row * blocks_per_row + block_col
-    absmax32_idx = row * ((blocks_per_row + 3) >> 2) + (block_col >> 2)
+    # Calculate scale indices
+    block_idx = cols_idx >> 6
+    absmax_idx = rows * blocks_per_row + block_idx
+    absmax32_idx = rows * ((blocks_per_row + 3) >> 2) + (block_idx >> 2)
     
     # Load scales
-    absmax_val = tl.load(absmax_ptr + absmax_idx, mask=mask, other=0)
-    absmax32_val = tl.load(absmax32_ptr + absmax32_idx, mask=mask, other=0.0)
+    absmax_vals = tl.load(absmax_ptr + absmax_idx, mask=mask, other=0)
+    absmax32_vals = tl.load(absmax32_ptr + absmax32_idx, mask=mask, other=0.0)
     
-    # Final dequantization with FMA
-    scale = absmax_val.to(tl.float32) * (1.0 / 127.0) * absmax32_val
-    output = codes * scale
+    # Final computation with FMA
+    scales = absmax_vals.to(tl.float32) * (1.0 / 127.0) * absmax32_vals
+    output_vals = nf4_vals * scales
     
     # Store results
-    tl.store(output_ptr + offsets, output, mask=mask)
+    tl.store(output_ptr + offsets, output_vals, mask=mask)
 
 def triton_dequantize_nf4(module):
-    """Optimized NF4 dequantization using Triton.
-    
-    Args:
-        module: A Linear4bit module with NF4 quantized weights
-        
-    Returns:
-        Dequantized weight tensor in fp16/bf16 format
-    """
+    """Optimized NF4 dequantization using Triton."""
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -91,9 +103,9 @@ def triton_dequantize_nf4(module):
     
     M = module.out_features
     N = module.in_features
-    n_elements = M * N
+    total_elements = M * N
     
-    # Calculate blocks per row
+    # Calculate blocks
     blocks_per_row = (N + 63) // 64
     
     # Prepare absmax tensor
@@ -117,28 +129,21 @@ def triton_dequantize_nf4(module):
     if absmax32.shape != (M, absmax32_per_row):
         return fast_dequantize(weight, quant_state)
     
-    # Allocate output tensor
+    # Allocate output
     output = torch.empty((M, N), dtype=dtype, device=device)
     
-    # Choose optimal block size based on matrix dimensions
-    if n_elements < 500_000:
-        BLOCK_SIZE = 256
-    elif n_elements < 5_000_000:
-        BLOCK_SIZE = 1024
-    elif n_elements < 50_000_000:
-        BLOCK_SIZE = 2048
-    else:
-        BLOCK_SIZE = 4096
+    # Use optimized block size
+    BLOCK_SIZE = 1024
     
     # Launch kernel
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    grid = (triton.cdiv(total_elements, BLOCK_SIZE),)
     
-    _nf4_dequantize_kernel[grid](
+    _ultra_fast_nf4_dequant[grid](
         qweight.view(-1),
         absmax.contiguous().view(-1),
         absmax32.contiguous().view(-1),
         output.view(-1),
-        n_elements,
+        total_elements,
         N,
         blocks_per_row,
         BLOCK_SIZE,
