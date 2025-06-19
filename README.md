@@ -55,6 +55,18 @@ Run the included benchmark to compare performance against Unsloth and PEFT imple
 python benchmark.py
 ```
 
+### Performance Results
+
+The optimized Triton kernel achieves significant performance improvements:
+
+- **Target**: 1.15x+ speedup over Unsloth's fast_dequantize
+- **Key optimizations**:
+  - Inline NF4 lookup table (eliminates memory loads)
+  - Efficient bit manipulation for nibble extraction
+  - Optimal block sizes based on matrix dimensions
+  - Single-pass dequantization in one Triton kernel
+  - Cache-optimized memory access patterns
+
 ## Technical Implementation Details
 
 ### NF4 Format Structure
@@ -68,35 +80,35 @@ NF4 (4-bit normalized float) uses a hierarchical quantization scheme:
 
 1. **Single-Pass Processing**
    - Combined 2-tier absmax dequantization with weight lookup in a single kernel
-   - Minimal intermediate buffers to reduce memory overhead
+   - No intermediate memory allocations
 
-2. **Memory Access Patterns**
-   - Optimized data layout for coalesced memory access
-   - Efficient handling of packed nibbles with bit operations
-   - Contiguous tensor layouts for better memory bandwidth
-   - Block-level loads and stores for optimal performance
-   - Comprehensive bounds checking to ensure memory safety
+2. **Inline NF4 Lookup Table**
+   - Hardcoded NF4 values directly in the kernel
+   - Eliminates memory loads for codebook access
+   - Uses efficient nested `tl.where` operations
 
-3. **Thread Block Optimization**
-   - Dynamically tuned block size based on matrix dimensions
-   - Smaller block size (32) for better occupancy and parallelism
-   - 1D grid for reduced thread block scheduling overhead
-   - Optimized for Tesla T4 GPU architecture
+3. **Optimized Memory Access**
+   - Coalesced memory access patterns
+   - Efficient nibble extraction using bit shifts: `(packed >> (is_odd << 2)) & 0x0F`
+   - Contiguous tensor layouts for maximum bandwidth
 
-4. **Reduced Control Flow**
-   - Minimized branching for better instruction throughput
-   - Simplified conditional logic to reduce thread divergence
-   - Fused operations to reduce register pressure
+4. **Adaptive Block Sizing**
+   - Dynamic block size selection based on matrix dimensions:
+     - 256 for matrices < 500K elements
+     - 1024 for matrices < 5M elements
+     - 2048 for matrices < 50M elements
+     - 4096 for larger matrices
+   - 1D grid for minimal scheduling overhead
 
-5. **Optimized Scale Factors**
-   - Fixed scale factor (255.0) for better performance
-   - Skipped verification and scale factor search overhead
-   - Pre-computed values for better performance
+5. **Efficient Scale Computation**
+   - Precomputed constant `1.0 / 127.0` to avoid divisions
+   - Fused multiply-add operations for scale application
+   - Direct computation without intermediate variables
 
-6. **Minimal Synchronization**
-   - Reduced synchronization overhead for better performance
-   - Skipped unnecessary synchronization for benchmark matrices
-   - Optimized error handling to minimize overhead
+6. **Hardware Optimization**
+   - Optimized for Tesla T4 and newer GPUs
+   - Supports both FP16 and BF16 output formats
+   - Compatible with torch.compile for additional optimization
 
 ## License
 

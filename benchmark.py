@@ -45,7 +45,8 @@ def assert_correct_bnb(weight, dtype):
     assert(weight.weight.quant_state.dtype == dtype)
     assert(weight.weight.quant_state.absmax.dtype == torch.uint8)
     assert(weight.weight.quant_state.code.dtype == torch.float32)
-    # assert(weight.weight.quant_state.offset.dtype == torch.float32) # Offset not always present
+    if hasattr(weight.weight.quant_state, 'offset'):
+        assert(weight.weight.quant_state.offset.dtype == torch.float32)
     assert(weight.weight.quant_state.blocksize == 64)
     assert(weight.weight.quant_state.state2.absmax.dtype == torch.float32)
     assert(weight.weight.quant_state.state2.code.dtype == torch.float32)
