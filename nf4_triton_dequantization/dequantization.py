@@ -4,6 +4,8 @@ import triton.language as tl
 from unsloth.kernels.utils import fast_dequantize
 from .optimized_kernel import ultra_fast_triton_dequantize_nf4
 from .extreme_optimization import extreme_triton_dequantize_nf4
+from .ultimate_kernel import ultimate_triton_dequantize_nf4
+from .final_optimization import final_triton_dequantize_nf4
 
 @triton.jit
 def _optimized_nf4_kernel(
@@ -164,11 +166,11 @@ def triton_dequantize_nf4(module):
     return output
 
 # For backward compatibility
-optimized_triton_dequantize_nf4 = extreme_triton_dequantize_nf4
-benchmark_fast_dequantize = extreme_triton_dequantize_nf4
+optimized_triton_dequantize_nf4 = final_triton_dequantize_nf4
+benchmark_fast_dequantize = final_triton_dequantize_nf4
 
-# Override the main function with the extreme optimized version
-triton_dequantize_nf4 = extreme_triton_dequantize_nf4
+# Override the main function with the final optimized version
+triton_dequantize_nf4 = final_triton_dequantize_nf4
 
 def reset_triton_dequantize_state():
     pass
