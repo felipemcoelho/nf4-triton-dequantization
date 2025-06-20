@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
-from transformers import set_seed
 import time
 import matplotlib.pyplot as plt
 import numpy as np
+from unsloth.kernels.utils import fast_dequantize
+from transformers import set_seed
 from bitsandbytes.nn import Linear4bit
 from transformers.activations import ACT2FN
-from unsloth.kernels.utils import fast_dequantize
 from peft.utils.integrations import dequantize_module_weight as peft_dequantize
 from nf4_triton_dequantization import triton_dequantize_nf4, reset_triton_dequantize_state
 
