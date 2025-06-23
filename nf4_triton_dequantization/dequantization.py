@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 from unsloth.kernels.utils import fast_dequantize
 from .max_perf import max_perf_triton_dequantize_nf4
+from .ultra_optimized import ultra_fast_triton_dequantize_nf4
+from .final_optimized import final_optimized_dequantize_nf4
 
 @triton.jit
 def _optimized_nf4_kernel(
@@ -166,8 +168,8 @@ def triton_dequantize_nf4(module):
 optimized_triton_dequantize_nf4 = max_perf_triton_dequantize_nf4
 benchmark_fast_dequantize = max_perf_triton_dequantize_nf4
 
-# Override the main function with the max performance version
-triton_dequantize_nf4 = max_perf_triton_dequantize_nf4
+# Override the main function with the final optimized version
+triton_dequantize_nf4 = final_optimized_dequantize_nf4
 
 def reset_triton_dequantize_state():
     pass
