@@ -1,201 +1,139 @@
 import torch
 import triton
 import triton.language as tl
-from unsloth.kernels.utils import fast_dequantize
+
+try:
+    from unsloth.kernels.utils import fast_dequantize
+except ImportError:
+    fast_dequantize = None
 
 @triton.jit
-def _hyper_optimized_nf4_kernel(
+def _hyper_optimized_kernel(
     qweight_ptr,
     absmax_ptr,
     absmax32_ptr,
     output_ptr,
-    m, n,
+    M, N,
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
     dtype: tl.constexpr,
 ):
-    """Hyper-optimized kernel that processes multiple rows and columns per thread."""
-    # 2D grid with better work distribution
+    """Hyper-optimized kernel combining all performance techniques."""
+    
+    # Grid setup - each thread processes 2 blocks (128 elements)
     pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(m, BLOCK_M)
-    num_pid_n = tl.cdiv(n, BLOCK_N)
+    BLOCKS_PER_THREAD: tl.constexpr = 2
     
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
+    start_block = pid * BLOCKS_PER_THREAD
+    total_blocks = M * blocks_per_row
     
-    if pid_m >= num_pid_m:
-        return
+    # Pre-computed NF4 constants as constexpr for register allocation
+    NF4_0: tl.constexpr = -1.0
+    NF4_1: tl.constexpr = -0.6961928009986877
+    NF4_2: tl.constexpr = -0.5250730514526367
+    NF4_3: tl.constexpr = -0.39491748809814453
+    NF4_4: tl.constexpr = -0.28444138169288635
+    NF4_5: tl.constexpr = -0.18477343022823334
+    NF4_6: tl.constexpr = -0.09105003625154495
+    NF4_7: tl.constexpr = 0.0
+    NF4_8: tl.constexpr = 0.07958029955625534
+    NF4_9: tl.constexpr = 0.16093020141124725
+    NF4_10: tl.constexpr = 0.24611230194568634
+    NF4_11: tl.constexpr = 0.33791524171829224
+    NF4_12: tl.constexpr = 0.44070982933044434
+    NF4_13: tl.constexpr = 0.5626170039176941
+    NF4_14: tl.constexpr = 0.7229568362236023
+    NF4_15: tl.constexpr = 1.0
+    NF4_SCALE: tl.constexpr = 0.00787401574803149606
     
-    # Row and column ranges
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    
-    # Masks
-    rm_mask = rm < m
-    rn_mask = rn < n
-    
-    # Pre-computed NF4 values as hex for faster loading
-    nf4_hex = tl.inline_const_array([
-        0xBF800000, 0xBF322E8C, 0xBF066E46, 0xBECA3244,
-        0xBE91CB77, 0xBE3D6EBC, 0xBDBA6B62, 0x00000000,
-        0x3DA30966, 0x3E24DE11, 0x3E7C1953, 0x3EAD1268,
-        0x3EE1E4F8, 0x3F100806, 0x3F38D666, 0x3F800000
-    ])
-    
-    # Process each block
-    for i in range(BLOCK_M):
-        row = rm[i]
-        if not rm_mask[i]:
+    # Unroll loop over blocks
+    for b in tl.static_range(BLOCKS_PER_THREAD):
+        block_id = start_block + b
+        if block_id >= total_blocks:
+            return
+            
+        # Decode block position
+        row = block_id // blocks_per_row
+        block_idx = block_id % blocks_per_row
+        col_base = block_idx << 6  # * 64
+        
+        if col_base >= N:
             continue
+        
+        # Load scales once per block
+        absmax = tl.load(absmax_ptr + block_id).to(tl.float32)
+        absmax32_idx = row * absmax32_per_row + (block_idx >> 2)
+        absmax32 = tl.load(absmax32_ptr + absmax32_idx)
+        scale = absmax * NF4_SCALE * absmax32
+        
+        base_offset = row * N + col_base
+        
+        # Process 64 elements in 4 chunks of 16 for maximum ILP
+        for chunk in tl.static_range(4):
+            offset = chunk << 4  # * 16
+            idx = base_offset + offset + tl.arange(0, 16)
+            cols = col_base + offset + tl.arange(0, 16)
+            mask = cols < N
             
-        for j in range(BLOCK_N):
-            col = rn[j]
-            if not rn_mask[j]:
-                continue
-                
-            # Calculate block index for this column
-            block_idx = col >> 6
-            col_in_block = col & 63
-            
-            # Skip if we're processing elements outside block boundary
-            if block_idx >= blocks_per_row:
-                continue
-            
-            # Load absmax values
-            absmax_idx = row * blocks_per_row + block_idx
-            absmax32_idx = row * absmax32_per_row + (block_idx >> 2)
-            
-            absmax = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
-            absmax32 = tl.load(absmax32_ptr + absmax32_idx)
-            scale = absmax * 0.00787401574803149606 * absmax32
-            
-            # Calculate index
-            idx = row * n + col
+            # Vectorized load
             packed_idx = idx >> 1
+            packed = tl.load(qweight_ptr + packed_idx, mask=mask, other=0)
             
-            # Load packed byte
-            packed = tl.load(qweight_ptr + packed_idx)
-            
-            # Extract nibble
+            # Optimized nibble extraction
             is_odd = idx & 1
-            nibble = (packed >> (is_odd << 2)) & 0xF
+            nibbles = tl.where(is_odd, (packed >> 4) & 0xF, packed & 0xF)
             
-            # Get NF4 value using hex lookup
-            hex_val = tl.gather(nf4_hex, nibble)
-            nf4_val = tl.bit_cast(hex_val, tl.float32)
+            # Direct mapping using nested conditionals (compiler optimizes this)
+            nf4_vals = tl.where(nibbles == 0, NF4_0,
+                       tl.where(nibbles == 1, NF4_1,
+                       tl.where(nibbles == 2, NF4_2,
+                       tl.where(nibbles == 3, NF4_3,
+                       tl.where(nibbles == 4, NF4_4,
+                       tl.where(nibbles == 5, NF4_5,
+                       tl.where(nibbles == 6, NF4_6,
+                       tl.where(nibbles == 7, NF4_7,
+                       tl.where(nibbles == 8, NF4_8,
+                       tl.where(nibbles == 9, NF4_9,
+                       tl.where(nibbles == 10, NF4_10,
+                       tl.where(nibbles == 11, NF4_11,
+                       tl.where(nibbles == 12, NF4_12,
+                       tl.where(nibbles == 13, NF4_13,
+                       tl.where(nibbles == 14, NF4_14,
+                       NF4_15)))))))))))))))
             
-            # Scale and store
-            output = (nf4_val * scale).to(dtype)
-            tl.store(output_ptr + idx, output)
-
-
-@triton.jit
-def _vector_optimized_kernel(
-    qweight_ptr,
-    absmax_ptr,
-    absmax32_ptr,
-    output_ptr,
-    m, n,
-    blocks_per_row: tl.constexpr,
-    absmax32_per_row: tl.constexpr,
-    dtype: tl.constexpr,
-):
-    """Vectorized kernel that processes full 64-element blocks."""
-    pid = tl.program_id(0)
-    
-    # Each thread processes one full 64-element block
-    total_blocks = m * blocks_per_row
-    if pid >= total_blocks:
-        return
-    
-    row = pid // blocks_per_row
-    block_in_row = pid % blocks_per_row
-    col_start = block_in_row << 6
-    
-    if col_start >= n:
-        return
-    
-    # Load absmax values once
-    absmax_idx = pid
-    absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
-    
-    absmax = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
-    absmax32 = tl.load(absmax32_ptr + absmax32_idx)
-    scale = absmax * 0.00787401574803149606 * absmax32
-    
-    # NF4 lookup table
-    nf4_vals = tl.inline_const_array([
-        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
-    ])
-    
-    # Process all 64 elements with maximum vectorization
-    base_idx = row * n + col_start
-    
-    # Unroll processing for better performance
-    for i in range(0, 64, 16):
-        if col_start + i >= n:
-            break
-            
-        # Process 16 elements at once
-        cols = col_start + i + tl.arange(0, 16)
-        mask = cols < n
-        
-        # Calculate indices
-        idx = base_idx + i + tl.arange(0, 16)
-        packed_idx = idx >> 1
-        
-        # Vectorized load
-        packed = tl.load(qweight_ptr + packed_idx, mask=mask, other=0)
-        
-        # Extract nibbles
-        is_odd = idx & 1
-        nibbles = tl.where(is_odd, (packed >> 4) & 0xF, packed & 0xF)
-        
-        # Vectorized lookup
-        nf4 = tl.gather(nf4_vals, nibbles)
-        
-        # Scale and store
-        output = (nf4 * scale).to(dtype)
-        tl.store(output_ptr + idx, output, mask=mask)
-
+            # Apply scale and store
+            output = (nf4_vals * scale).to(dtype)
+            tl.store(output_ptr + idx, output, mask=mask)
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64}, num_warps=1),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128}, num_warps=2),
-        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 64}, num_warps=2),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 64}, num_warps=4),
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=3),
     ],
-    key=['m', 'n'],
+    key=['M', 'N'],
 )
 @triton.jit
-def _autotuned_hyper_kernel(
+def _hyper_autotuned_kernel(
     qweight_ptr,
     absmax_ptr,
     absmax32_ptr,
     output_ptr,
-    m, n,
+    M, N,
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
     dtype: tl.constexpr,
 ):
-    """Autotuned wrapper for finding optimal configuration."""
-    _hyper_optimized_nf4_kernel(
+    """Autotuned version for different problem sizes."""
+    _hyper_optimized_kernel(
         qweight_ptr, absmax_ptr, absmax32_ptr, output_ptr,
-        m, n, blocks_per_row, absmax32_per_row,
-        BLOCK_M, BLOCK_N, dtype
+        M, N, blocks_per_row, absmax32_per_row, dtype
     )
 
-
-def hyper_optimized_dequantize_nf4(module):
-    """Hyper-optimized NF4 dequantization for maximum performance."""
+def hyper_triton_dequantize_nf4(module):
+    """Hyper-optimized NF4 dequantization targeting 1.15x+ speedup."""
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -211,7 +149,7 @@ def hyper_optimized_dequantize_nf4(module):
     blocks_per_row = (N + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
     
-    # Handle absmax shapes
+    # Prepare absmax
     if absmax.dim() == 1:
         if absmax.numel() == blocks_per_row:
             absmax = absmax.unsqueeze(0).expand(M, -1)
@@ -219,8 +157,12 @@ def hyper_optimized_dequantize_nf4(module):
             absmax = absmax.view(M, blocks_per_row)
     
     if absmax.shape != (M, blocks_per_row):
-        return fast_dequantize(weight, quant_state)
+        if fast_dequantize is not None:
+            return fast_dequantize(weight, quant_state)
+        else:
+            raise ValueError("Invalid absmax shape and fast_dequantize not available")
     
+    # Prepare absmax32
     if absmax32.dim() == 1:
         if absmax32.numel() == absmax32_per_row:
             absmax32 = absmax32.unsqueeze(0).expand(M, -1)
@@ -228,23 +170,37 @@ def hyper_optimized_dequantize_nf4(module):
             absmax32 = absmax32.view(M, absmax32_per_row)
     
     if absmax32.shape != (M, absmax32_per_row):
-        return fast_dequantize(weight, quant_state)
+        if fast_dequantize is not None:
+            return fast_dequantize(weight, quant_state)
+        else:
+            raise ValueError("Invalid absmax32 shape and fast_dequantize not available")
     
     # Ensure contiguous
     qweight = qweight.contiguous()
     absmax = absmax.contiguous()
     absmax32 = absmax32.contiguous()
     
-    # Allocate output
     output = torch.empty((M, N), dtype=dtype, device=device)
     
-    # Choose kernel based on problem size
-    if M * N < 512 * 512:
-        # Small matrices - use simple vectorized kernel
-        total_blocks = M * blocks_per_row
-        grid = (total_blocks,)
-        
-        _vector_optimized_kernel[grid](
+    # Grid configuration
+    BLOCKS_PER_THREAD = 2
+    total_blocks = M * blocks_per_row
+    grid_size = (total_blocks + BLOCKS_PER_THREAD - 1) // BLOCKS_PER_THREAD
+    
+    # Use autotuned kernel for better performance
+    if M * N > 1024 * 1024:  # Large matrices
+        _hyper_autotuned_kernel[(grid_size,)](
+            qweight.view(-1),
+            absmax.view(-1),
+            absmax32.view(-1),
+            output.view(-1),
+            M, N,
+            blocks_per_row,
+            absmax32_per_row,
+            dtype,
+        )
+    else:  # Small matrices
+        _hyper_optimized_kernel[(grid_size,)](
             qweight.view(-1),
             absmax.view(-1),
             absmax32.view(-1),
@@ -254,20 +210,10 @@ def hyper_optimized_dequantize_nf4(module):
             absmax32_per_row,
             dtype,
             num_warps=2,
-        )
-    else:
-        # Large matrices - use autotuned kernel
-        grid = lambda META: (tl.cdiv(M, META['BLOCK_M']) * tl.cdiv(N, META['BLOCK_N']),)
-        
-        _autotuned_hyper_kernel[grid](
-            qweight.view(-1),
-            absmax.view(-1),
-            absmax32.view(-1),
-            output.view(-1),
-            M, N,
-            blocks_per_row,
-            absmax32_per_row,
-            dtype=dtype,
+            num_stages=2,
         )
     
     return output
+
+# Export
+triton_dequantize_nf4 = hyper_triton_dequantize_nf4
