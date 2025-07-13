@@ -159,7 +159,26 @@ def _original_triton_dequantize_nf4(module):
 
 def triton_dequantize_nf4(module):
     """Main entry point for NF4 dequantization."""
-    # Try to use hyper-optimized version if available
+    # Try optimized versions in order of performance
+    try:
+        from .final_ultra_optimized import final_ultra_dequantize_nf4
+        return final_ultra_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+        
+    try:
+        from .ultra_fast_v2 import ultra_fast_dequantize_nf4_v2
+        return ultra_fast_dequantize_nf4_v2(module)
+    except (ImportError, Exception):
+        pass
+    
+    try:
+        from .extreme_optimized_v2 import extreme_optimized_dequantize_nf4
+        return extreme_optimized_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+    
+    # Fallback to hyper-optimized version
     global hyper_triton_dequantize_nf4
     if hyper_triton_dequantize_nf4 is None:
         try:
