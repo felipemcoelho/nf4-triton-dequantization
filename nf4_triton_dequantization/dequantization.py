@@ -161,6 +161,24 @@ def triton_dequantize_nf4(module):
     """Main entry point for NF4 dequantization."""
     # Try optimized versions in order of performance
     try:
+        from .hyperdrive import hyperdrive_dequantize_nf4
+        return hyperdrive_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+    
+    try:
+        from .warp_speed import warp_speed_dequantize_nf4
+        return warp_speed_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+    
+    try:
+        from .supersonic import supersonic_dequantize_nf4
+        return supersonic_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+    
+    try:
         from .turbo_ultimate import turbo_ultimate_dequantize_nf4
         return turbo_ultimate_dequantize_nf4(module)
     except (ImportError, Exception):
