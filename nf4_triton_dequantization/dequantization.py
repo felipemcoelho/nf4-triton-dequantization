@@ -5,14 +5,10 @@ import triton.language as tl
 try:
     from unsloth.kernels.utils import fast_dequantize
 except ImportError:
-    # Fallback if unsloth is not available
     fast_dequantize = None
 
-# Lazy imports to avoid circular dependencies
-hyper_triton_dequantize_nf4 = None
-
 @triton.jit
-def _optimized_nf4_kernel(
+def _nf4_dequantize_kernel(
     qweight_ptr,
     absmax_ptr,
     absmax32_ptr,
@@ -20,72 +16,89 @@ def _optimized_nf4_kernel(
     M, N,
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
-    dtype: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
 ):
-    """Ultra-optimized NF4 kernel for 1.15x+ speedup."""
-    # Grid setup - process multiple blocks per thread
-    pid = tl.program_id(0)
-    BLOCKS_PER_THREAD: tl.constexpr = 2
+    """NF4 dequantization kernel."""
     
-    # NF4 lookup table in registers/shared memory
-    nf4_lut = tl.inline_const_array([
-        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
-    ])
+    # Each program processes one 64-element block
+    bid = tl.program_id(0)
     
-    # Process multiple blocks per thread
-    start_block = pid * BLOCKS_PER_THREAD
     total_blocks = M * blocks_per_row
+    if bid >= total_blocks:
+        return
     
-    for block_offset in range(BLOCKS_PER_THREAD):
-        block_id = start_block + block_offset
-        if block_id >= total_blocks:
-            return
-        
-        # Decode position
-        row = block_id // blocks_per_row
-        block_idx = block_id % blocks_per_row
-        col_base = block_idx * 64
-        
-        if col_base >= N:
-            continue
-        
-        # Load scales once per block
-        absmax = tl.load(absmax_ptr + block_id).to(tl.float32)
-        absmax32_idx = row * absmax32_per_row + (block_idx >> 2)
-        absmax32 = tl.load(absmax32_ptr + absmax32_idx)
-        scale = absmax * 0.00787401574803149606 * absmax32
-        
-        # Base offset
-        base_offset = row * N + col_base
-        
-        # Process 64 elements in 2 chunks of 32 for better vectorization
-        for chunk in range(2):
-            chunk_offset = chunk * 32
-            cols = col_base + chunk_offset + tl.arange(0, 32)
-            mask = cols < N
-            
-            idx = base_offset + chunk_offset + tl.arange(0, 32)
-            packed_idx = idx >> 1
-            
-            # Load packed data
-            packed = tl.load(qweight_ptr + packed_idx, mask=mask, other=0)
-            
-            # Extract nibbles
-            is_odd = idx & 1
-            nibbles = tl.where(is_odd, (packed >> 4) & 0xF, packed & 0xF)
-            
-            # Use lookup table
-            nf4_vals = tl.load(nf4_lut + nibbles, mask=mask, other=0.0)
-            
-            # Apply scale and store
-            output = (nf4_vals * scale).to(dtype)
-            tl.store(output_ptr + idx, output, mask=mask)
+    # Decode position
+    row = bid // blocks_per_row
+    block_idx = bid % blocks_per_row
+    col_base = block_idx * 64
+    
+    if col_base >= N:
+        return
+    
+    # Load scales
+    absmax = tl.load(absmax_ptr + bid).to(tl.float32)
+    absmax32_idx = row * absmax32_per_row + (block_idx >> 2)
+    absmax32 = tl.load(absmax32_ptr + absmax32_idx)
+    scale = absmax * 0.00787401574803149606 * absmax32
+    
+    # Base addresses
+    qweight_base = row * (N >> 1) + (col_base >> 1)
+    output_base = row * N + col_base
+    
+    # Load 32 packed bytes
+    packed = tl.load(qweight_ptr + qweight_base + tl.arange(0, 32))
+    
+    # Extract nibbles
+    low = packed & 0xF
+    high = (packed >> 4) & 0xF
+    
+    # NF4 lookup
+    low_vals = tl.where(low == 0, -1.0,
+               tl.where(low == 1, -0.6961928009986877,
+               tl.where(low == 2, -0.5250730514526367,
+               tl.where(low == 3, -0.39491748809814453,
+               tl.where(low == 4, -0.28444138169288635,
+               tl.where(low == 5, -0.18477343022823334,
+               tl.where(low == 6, -0.09105003625154495,
+               tl.where(low == 7, 0.0,
+               tl.where(low == 8, 0.07958029955625534,
+               tl.where(low == 9, 0.16093020141124725,
+               tl.where(low == 10, 0.24611230194568634,
+               tl.where(low == 11, 0.33791524171829224,
+               tl.where(low == 12, 0.44070982933044434,
+               tl.where(low == 13, 0.5626170039176941,
+               tl.where(low == 14, 0.7229568362236023,
+               1.0)))))))))))))))
+    
+    high_vals = tl.where(high == 0, -1.0,
+                tl.where(high == 1, -0.6961928009986877,
+                tl.where(high == 2, -0.5250730514526367,
+                tl.where(high == 3, -0.39491748809814453,
+                tl.where(high == 4, -0.28444138169288635,
+                tl.where(high == 5, -0.18477343022823334,
+                tl.where(high == 6, -0.09105003625154495,
+                tl.where(high == 7, 0.0,
+                tl.where(high == 8, 0.07958029955625534,
+                tl.where(high == 9, 0.16093020141124725,
+                tl.where(high == 10, 0.24611230194568634,
+                tl.where(high == 11, 0.33791524171829224,
+                tl.where(high == 12, 0.44070982933044434,
+                tl.where(high == 13, 0.5626170039176941,
+                tl.where(high == 14, 0.7229568362236023,
+                1.0)))))))))))))))
+    
+    # Scale and store
+    low_scaled = low_vals * scale
+    high_scaled = high_vals * scale
+    
+    # Store interleaved
+    for i in range(32):
+        if col_base + i * 2 < N:
+            tl.store(output_ptr + output_base + i * 2, low_scaled[i])
+        if col_base + i * 2 + 1 < N:
+            tl.store(output_ptr + output_base + i * 2 + 1, high_scaled[i])
 
-def _original_triton_dequantize_nf4(module):
+def triton_dequantize_nf4(module):
+    """NF4 dequantization using Triton."""
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -99,8 +112,9 @@ def _original_triton_dequantize_nf4(module):
     N = module.in_features
     
     blocks_per_row = (N + 63) // 64
+    absmax32_per_row = (blocks_per_row + 3) // 4
     
-    # Prepare absmax
+    # Handle tensor shapes
     if absmax.dim() == 1:
         if absmax.numel() == blocks_per_row:
             absmax = absmax.unsqueeze(0).expand(M, -1)
@@ -111,10 +125,8 @@ def _original_triton_dequantize_nf4(module):
         if fast_dequantize is not None:
             return fast_dequantize(weight, quant_state)
         else:
-            raise ValueError("Invalid absmax shape and fast_dequantize not available")
+            raise ValueError("Invalid absmax shape")
     
-    # Prepare absmax32
-    absmax32_per_row = (blocks_per_row + 3) // 4
     if absmax32.dim() == 1:
         if absmax32.numel() == absmax32_per_row:
             absmax32 = absmax32.unsqueeze(0).expand(M, -1)
@@ -125,23 +137,19 @@ def _original_triton_dequantize_nf4(module):
         if fast_dequantize is not None:
             return fast_dequantize(weight, quant_state)
         else:
-            raise ValueError("Invalid absmax32 shape and fast_dequantize not available")
+            raise ValueError("Invalid absmax32 shape")
     
-    # Ensure contiguous tensors
+    # Ensure contiguous
     qweight = qweight.contiguous()
     absmax = absmax.contiguous()
     absmax32 = absmax32.contiguous()
     
+    # Allocate output
     output = torch.empty((M, N), dtype=dtype, device=device)
     
-    # Optimized grid configuration - fewer threads processing more blocks each
-    BLOCKS_PER_THREAD = 2
+    # Launch kernel
     total_blocks = M * blocks_per_row
-    grid_size = (total_blocks + BLOCKS_PER_THREAD - 1) // BLOCKS_PER_THREAD
-    BLOCK_SIZE = 128
-    
-    # Launch kernel with optimal configuration
-    _optimized_nf4_kernel[grid_size,](
+    _nf4_dequantize_kernel[(total_blocks,)](
         qweight.view(-1),
         absmax.view(-1),
         absmax32.view(-1),
@@ -149,117 +157,11 @@ def _original_triton_dequantize_nf4(module):
         M, N,
         blocks_per_row,
         absmax32_per_row,
-        dtype,
-        BLOCK_SIZE,
-        num_warps=2,  # Optimal for T4 with multi-block processing
-        num_stages=2,  # Enable pipelining
+        num_warps=1,
+        num_stages=1,
     )
     
     return output
-
-def triton_dequantize_nf4(module):
-    """Main entry point for NF4 dequantization."""
-    # Try optimized versions in order of performance
-    try:
-        from .blazing_fast import blazing_fast_dequantize_nf4
-        return blazing_fast_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .ultimate_speed import ultimate_speed_dequantize_nf4
-        return ultimate_speed_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .photon_drive import photon_drive_dequantize_nf4
-        return photon_drive_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .quantum_leap import quantum_leap_dequantize_nf4
-        return quantum_leap_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .hyperdrive import hyperdrive_dequantize_nf4
-        return hyperdrive_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .warp_speed import warp_speed_dequantize_nf4
-        return warp_speed_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .supersonic import supersonic_dequantize_nf4
-        return supersonic_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .turbo_ultimate import turbo_ultimate_dequantize_nf4
-        return turbo_ultimate_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .apex_optimized import apex_optimized_dequantize_nf4
-        return apex_optimized_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .lightning_fast import lightning_fast_dequantize_nf4
-        return lightning_fast_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .stream_optimized import stream_optimized_dequantize_nf4
-        return stream_optimized_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-        
-    try:
-        from .ultimate_fast import ultimate_fast_dequantize_nf4
-        return ultimate_fast_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-        
-    try:
-        from .final_ultra_optimized import final_ultra_dequantize_nf4
-        return final_ultra_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-        
-    try:
-        from .ultra_fast_v2 import ultra_fast_dequantize_nf4_v2
-        return ultra_fast_dequantize_nf4_v2(module)
-    except (ImportError, Exception):
-        pass
-    
-    try:
-        from .extreme_optimized_v2 import extreme_optimized_dequantize_nf4
-        return extreme_optimized_dequantize_nf4(module)
-    except (ImportError, Exception):
-        pass
-    
-    # Fallback to hyper-optimized version
-    global hyper_triton_dequantize_nf4
-    if hyper_triton_dequantize_nf4 is None:
-        try:
-            from .hyper_optimized import hyper_triton_dequantize_nf4 as hyper_fn
-            hyper_triton_dequantize_nf4 = hyper_fn
-        except ImportError:
-            hyper_triton_dequantize_nf4 = _original_triton_dequantize_nf4
-    
-    return hyper_triton_dequantize_nf4(module)
 
 # For backward compatibility
 optimized_triton_dequantize_nf4 = triton_dequantize_nf4
