@@ -99,6 +99,13 @@ def _nf4_dequantize_kernel(
 
 def triton_dequantize_nf4(module):
     """NF4 dequantization using Triton."""
+    # Try fused optimized version first
+    try:
+        from .fused_optimized import fused_triton_dequantize_nf4
+        return fused_triton_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+    
     weight = module.weight
     quant_state = weight.quant_state
     
