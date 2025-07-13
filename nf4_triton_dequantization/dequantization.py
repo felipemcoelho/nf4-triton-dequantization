@@ -161,6 +161,24 @@ def triton_dequantize_nf4(module):
     """Main entry point for NF4 dequantization."""
     # Try optimized versions in order of performance
     try:
+        from .turbo_ultimate import turbo_ultimate_dequantize_nf4
+        return turbo_ultimate_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+    
+    try:
+        from .apex_optimized import apex_optimized_dequantize_nf4
+        return apex_optimized_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+    
+    try:
+        from .lightning_fast import lightning_fast_dequantize_nf4
+        return lightning_fast_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+    
+    try:
         from .stream_optimized import stream_optimized_dequantize_nf4
         return stream_optimized_dequantize_nf4(module)
     except (ImportError, Exception):
