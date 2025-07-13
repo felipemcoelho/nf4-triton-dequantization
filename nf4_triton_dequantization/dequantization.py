@@ -161,6 +161,18 @@ def triton_dequantize_nf4(module):
     """Main entry point for NF4 dequantization."""
     # Try optimized versions in order of performance
     try:
+        from .stream_optimized import stream_optimized_dequantize_nf4
+        return stream_optimized_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+        
+    try:
+        from .ultimate_fast import ultimate_fast_dequantize_nf4
+        return ultimate_fast_dequantize_nf4(module)
+    except (ImportError, Exception):
+        pass
+        
+    try:
         from .final_ultra_optimized import final_ultra_dequantize_nf4
         return final_ultra_dequantize_nf4(module)
     except (ImportError, Exception):
