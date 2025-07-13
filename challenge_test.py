@@ -7,6 +7,7 @@ from transformers.activations import ACT2FN
 from unsloth.kernels.utils import fast_dequantize
 from peft.utils.integrations import dequantize_module_weight as peft_dequantize
 from nf4_triton_dequantization.ultra_optimized import ultra_fast_triton_dequantize_nf4
+from nf4_triton_dequantization.turbo_optimized import turbo_dequantize_nf4
 
 # Challenge test implementation exactly as specified
 
@@ -118,92 +119,67 @@ def _your_dequantize_nf4_kernel(
     m, n,
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
-    TILE_M: tl.constexpr,
-    TILE_N: tl.constexpr,
     dtype: tl.constexpr,
 ):
-    """Ultra-optimized NF4 dequantization kernel for 1.15x+ speedup."""
-    # 2D grid for better parallelism
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """Ultra-fast NF4 kernel optimized for maximum throughput."""
+    # Each thread processes one 64-element block
+    pid = tl.program_id(0)
     
-    # Early exit
-    if pid_m >= tl.cdiv(m, TILE_M):
+    total_blocks = m * blocks_per_row
+    if pid >= total_blocks:
         return
     
-    # Row bounds
-    row_start = pid_m * TILE_M
-    row_end = tl.minimum(row_start + TILE_M, m)
+    # Decode position
+    row = pid // blocks_per_row
+    block_in_row = pid % blocks_per_row
+    col_start = block_in_row * 64
     
-    # Pre-compute constants
-    scale_factor = 0.00787401574803149606  # 1/127
+    if col_start >= n:
+        return
     
-    # Split NF4 lookup for better performance
-    nf4_low = tl.inline_const_array([
+    # Load absmax values once
+    absmax_idx = pid
+    absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
+    
+    absmax = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
+    absmax32 = tl.load(absmax32_ptr + absmax32_idx)
+    scale = absmax * 0.00787401574803149606 * absmax32
+    
+    # Base indices
+    row_offset = row * n
+    base_idx = row_offset + col_start
+    
+    # NF4 lookup table as single array
+    nf4_lut = tl.inline_const_array([
         -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0
-    ])
-    nf4_high = tl.inline_const_array([
+        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
         0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
         0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
     ])
     
-    # Process blocks assigned to this thread
-    num_blocks = (n + 63) // 64
-    blocks_per_thread = (num_blocks + tl.num_programs(1) - 1) // tl.num_programs(1)
-    block_start = pid_n * blocks_per_thread
-    block_end = tl.minimum(block_start + blocks_per_thread, num_blocks)
-    
-    # Process each 64-element block
-    for block_idx in range(block_start, block_end):
-        col_start = block_idx * 64
-        if col_start >= n:
-            break
+    # Process 64 elements in 4 vectorized chunks of 16
+    for chunk in range(4):
+        offset = chunk * 16
+        col = col_start + offset + tl.arange(0, 16)
+        mask = col < n
         
-        # Calculate absmax indices
-        absmax32_idx = block_idx >> 2
+        # Vectorized index calculation
+        idx = base_idx + offset + tl.arange(0, 16)
+        packed_idx = idx >> 1
         
-        # Process each row in the tile
-        for row in range(row_start, row_end):
-            # Load scaling factors
-            absmax_idx = row * blocks_per_row + block_idx
-            absmax = tl.load(absmax_ptr + absmax_idx, eviction_policy="evict_first").to(tl.float32)
-            
-            absmax32_offset = row * absmax32_per_row + absmax32_idx
-            absmax32 = tl.load(absmax32_ptr + absmax32_offset, eviction_policy="evict_first")
-            
-            # Compute scale
-            scale = absmax * scale_factor * absmax32
-            
-            # Process 64 elements in 2x32 chunks for better vectorization
-            for i in range(0, 64, 32):
-                col = col_start + i + tl.arange(0, 32)
-                mask = col < n
-                
-                # Calculate indices
-                idx = row * n + col
-                packed_idx = idx >> 1
-                
-                # Load packed data
-                packed = tl.load(qweight_ptr + packed_idx, mask=mask, other=0, eviction_policy="evict_first")
-                
-                # Extract nibbles with optimized bit ops
-                is_odd = (idx & 1)
-                nibbles = ((packed >> (is_odd << 2)) & 0xF)
-                
-                # Optimized lookup using split arrays
-                is_high = nibbles >= 8
-                idx_low = nibbles
-                idx_high = nibbles - 8
-                
-                val_low = tl.gather(nf4_low, idx_low)
-                val_high = tl.gather(nf4_high, idx_high)
-                
-                nf4_val = tl.where(is_high, val_high, val_low)
-                
-                # Scale and store
-                output = (nf4_val * scale).to(dtype)
-                tl.store(output_ptr + idx, output, mask=mask, eviction_policy="evict_first")
+        # Load 8 bytes (16 nibbles) at once
+        packed = tl.load(qweight_ptr + packed_idx, mask=mask, other=0)
+        
+        # Extract nibbles efficiently
+        is_odd = idx & 1
+        nibbles = tl.where(is_odd, (packed >> 4) & 0xF, packed & 0xF)
+        
+        # Direct lookup
+        nf4_vals = tl.gather(nf4_lut, nibbles)
+        
+        # Scale and store
+        output = (nf4_vals * scale).to(dtype)
+        tl.store(output_ptr + idx, output, mask=mask)
 
 def _your_dequantize_nf4(weight, quant_state):
     """Setup function for the optimized Triton kernel."""
@@ -246,16 +222,17 @@ def _your_dequantize_nf4(weight, quant_state):
     # Allocate output
     output = torch.empty((M, N), dtype=dtype, device=device)
     
-    # Optimal tile sizes based on GPU architecture
-    TILE_M = 1 if M < 32 else 2
+    # Simple 1D grid - one thread per 64-element block
+    total_blocks = M * blocks_per_row
+    grid = (total_blocks,)
     
-    # Calculate optimal grid dimensions
-    num_blocks = (N + 63) // 64
-    grid_m = (M + TILE_M - 1) // TILE_M
-    grid_n = min(32, num_blocks)  # Limit parallelism in N dimension
-    
-    # Launch kernel with 2D grid
-    grid = (grid_m, grid_n)
+    # Optimal warps based on problem size
+    if total_blocks < 1024:
+        num_warps = 2
+    elif total_blocks < 4096:
+        num_warps = 4
+    else:
+        num_warps = 8
     
     _your_dequantize_nf4_kernel[grid](
         qweight.view(-1),
@@ -265,10 +242,8 @@ def _your_dequantize_nf4(weight, quant_state):
         M, N,
         blocks_per_row,
         absmax32_per_row,
-        TILE_M,
-        32,  # TILE_N for processing
         dtype,
-        num_warps=4,
+        num_warps=num_warps,
     )
     
     return output
@@ -311,3 +286,14 @@ if __name__ == "__main__":
     ultra_time = test_dequantize(ultra_fast_triton_dequantize_nf4)
     ultra_speedup = unsloth_time / ultra_time
     print(f"Ultra-optimized speedup: {ultra_speedup:.4f}x")
+    
+    # Test turbo version
+    print("\nTesting turbo-optimized version...")
+    turbo_time = test_dequantize(turbo_dequantize_nf4)
+    turbo_speedup = unsloth_time / turbo_time
+    print(f"Turbo-optimized speedup: {turbo_speedup:.4f}x")
+    
+    # Find best result
+    best_time = min(your_time, ultra_time, turbo_time)
+    best_speedup = unsloth_time / best_time
+    print(f"\nBest speedup achieved: {best_speedup:.4f}x")

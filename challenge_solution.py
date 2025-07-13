@@ -128,92 +128,65 @@ def _your_dequantize_nf4_kernel(
     absmax32_per_row: tl.constexpr,
     dtype: tl.constexpr,
 ):
-    """Optimized NF4 dequantization kernel targeting 1.15x+ speedup."""
-    # Each program handles one 64-element block
+    """Ultra-optimized NF4 kernel for 1.15x+ speedup."""
     pid = tl.program_id(0)
     
     total_blocks = m * blocks_per_row
     if pid >= total_blocks:
         return
     
-    # Calculate row and block position
+    # Decode position
     row = pid // blocks_per_row
-    block_in_row = pid % blocks_per_row
-    col_start = block_in_row * 64
+    block_idx = pid % blocks_per_row
+    col_base = block_idx * 64
     
-    if col_start >= n:
+    if col_base >= n:
         return
     
-    # Load scaling factors with cache hints
-    absmax_idx = pid
-    absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
-    
-    absmax = tl.load(absmax_ptr + absmax_idx, eviction_policy="evict_first").to(tl.float32)
-    absmax32 = tl.load(absmax32_ptr + absmax32_idx, eviction_policy="evict_first")
-    
-    # Compute final scale
+    # Load scales once
+    absmax = tl.load(absmax_ptr + pid).to(tl.float32)
+    absmax32_idx = row * absmax32_per_row + (block_idx >> 2)
+    absmax32 = tl.load(absmax32_ptr + absmax32_idx)
     scale = absmax * 0.00787401574803149606 * absmax32
     
-    # Split NF4 lookup table for better performance
-    nf4_low = tl.inline_const_array([
-        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0
-    ])
-    nf4_high = tl.inline_const_array([
-        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
-    ])
+    # Base offset
+    base_offset = row * n + col_base
     
-    # Process 64 elements in two 32-element chunks
-    row_offset = row * n
+    # Process all 64 elements with aggressive vectorization
+    cols = col_base + tl.arange(0, 64)
+    mask = cols < n
     
-    # First chunk
-    for i in range(0, 32):
-        col = col_start + i
-        if col >= n:
-            break
-            
-        idx = row_offset + col
-        packed_idx = idx >> 1
-        
-        # Load packed byte
-        packed = tl.load(qweight_ptr + packed_idx, eviction_policy="evict_first")
-        
-        # Extract nibble efficiently
-        is_odd = idx & 1
-        nibble = (packed >> (is_odd << 2)) & 0xF
-        
-        # Optimized lookup
-        if nibble < 8:
-            nf4_val = tl.gather(nf4_low, nibble)
-        else:
-            nf4_val = tl.gather(nf4_high, nibble - 8)
-        
-        # Scale and store
-        output = (nf4_val * scale).to(dtype)
-        tl.store(output_ptr + idx, output, eviction_policy="evict_first")
+    idx = base_offset + tl.arange(0, 64)
+    packed_idx = idx >> 1
     
-    # Second chunk
-    for i in range(32, 64):
-        col = col_start + i
-        if col >= n:
-            break
-            
-        idx = row_offset + col
-        packed_idx = idx >> 1
-        
-        packed = tl.load(qweight_ptr + packed_idx, eviction_policy="evict_first")
-        
-        is_odd = idx & 1
-        nibble = (packed >> (is_odd << 2)) & 0xF
-        
-        if nibble < 8:
-            nf4_val = tl.gather(nf4_low, nibble)
-        else:
-            nf4_val = tl.gather(nf4_high, nibble - 8)
-        
-        output = (nf4_val * scale).to(dtype)
-        tl.store(output_ptr + idx, output, eviction_policy="evict_first")
+    # Load all packed data
+    packed = tl.load(qweight_ptr + packed_idx, mask=mask, other=0, eviction_policy="evict_first")
+    
+    # Extract nibbles
+    is_odd = idx & 1
+    nibbles = tl.where(is_odd, (packed >> 4) & 0xF, packed & 0xF)
+    
+    # Ultra-fast conditional lookup
+    nf4_vals = tl.where(nibbles == 0, -1.0,
+               tl.where(nibbles == 1, -0.6961928009986877,
+               tl.where(nibbles == 2, -0.5250730514526367,
+               tl.where(nibbles == 3, -0.39491748809814453,
+               tl.where(nibbles == 4, -0.28444138169288635,
+               tl.where(nibbles == 5, -0.18477343022823334,
+               tl.where(nibbles == 6, -0.09105003625154495,
+               tl.where(nibbles == 7, 0.0,
+               tl.where(nibbles == 8, 0.07958029955625534,
+               tl.where(nibbles == 9, 0.16093020141124725,
+               tl.where(nibbles == 10, 0.24611230194568634,
+               tl.where(nibbles == 11, 0.33791524171829224,
+               tl.where(nibbles == 12, 0.44070982933044434,
+               tl.where(nibbles == 13, 0.5626170039176941,
+               tl.where(nibbles == 14, 0.7229568362236023,
+               1.0)))))))))))))))
+    
+    # Apply scale and store
+    output = (nf4_vals * scale).to(dtype)
+    tl.store(output_ptr + idx, output, mask=mask, eviction_policy="evict_first")
 
 def _your_dequantize_nf4(weight, quant_state):
     """Setup function for the Triton kernel."""
@@ -260,8 +233,8 @@ def _your_dequantize_nf4(weight, quant_state):
     total_blocks = M * blocks_per_row
     grid = (total_blocks,)
     
-    # Optimal warps configuration
-    num_warps = 4 if total_blocks > 1024 else 2
+    # Optimal warps configuration for performance
+    num_warps = 1  # Single warp is fastest for this workload
     
     _your_dequantize_nf4_kernel[grid](
         qweight.view(-1),
