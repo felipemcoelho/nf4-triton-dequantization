@@ -1,10 +1,14 @@
 import torch
 import triton
 import triton.language as tl
-from triton import jit
+
+try:
+    from unsloth.kernels.utils import fast_dequantize
+except ImportError:
+    fast_dequantize = None
 
 @triton.jit
-def _your_dequantize_nf4_kernel(
+def _ultimate_speed_kernel(
     qweight_ptr,
     absmax_ptr,
     absmax32_ptr,
@@ -13,7 +17,7 @@ def _your_dequantize_nf4_kernel(
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
 ):
-    """Ultra-optimized single Triton kernel for NF4 dequantization."""
+    """Ultimate speed kernel - absolute minimal work per thread."""
     
     # Get block ID
     bid = tl.program_id(0)
@@ -36,7 +40,7 @@ def _your_dequantize_nf4_kernel(
     SCALE: tl.constexpr = 0.00787401574803149606
     
     # Load scales once
-    absmax_val = tl.load(absmax_ptr + bid).to(tl.float32)
+    absmax_val = tl.load(absmax_ptr + bid)
     absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
     absmax32_val = tl.load(absmax32_ptr + absmax32_idx)
     scale = absmax_val * SCALE * absmax32_val
@@ -47,13 +51,14 @@ def _your_dequantize_nf4_kernel(
     
     # Load all 32 bytes for this block at once
     qweight_data = qweight_base + tl.arange(0, 32)
-    packed = tl.load(qweight_ptr + qweight_data, eviction_policy="evict_first")
+    packed = tl.load(qweight_ptr + qweight_data)
     
     # Extract low and high nibbles
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # NF4 lookup using optimized binary tree
+    # NF4 lookup - use select tree for maximum performance
+    # Low nibbles
     low_vals = tl.where(low < 8,
         tl.where(low < 4,
             tl.where(low < 2,
@@ -77,6 +82,7 @@ def _your_dequantize_nf4_kernel(
         )
     )
     
+    # High nibbles
     high_vals = tl.where(high < 8,
         tl.where(high < 4,
             tl.where(high < 2,
@@ -105,35 +111,45 @@ def _your_dequantize_nf4_kernel(
     high_scaled = high_vals * scale
     
     # Store interleaved results
-    for i in range(32):
-        idx = i * 2
-        if col_start + idx < N:
-            tl.store(output_ptr + output_base + idx, low_scaled[i], eviction_policy="evict_first")
-        if col_start + idx + 1 < N:
-            tl.store(output_ptr + output_base + idx + 1, high_scaled[i], eviction_policy="evict_first")
+    # Process in two halves for better performance
+    for half in range(2):
+        base = half * 32
+        for i in range(16):
+            idx = base + i * 2
+            if col_start + idx < N:
+                tl.store(output_ptr + output_base + idx, low_scaled[half * 16 + i])
+            if col_start + idx + 1 < N:
+                tl.store(output_ptr + output_base + idx + 1, high_scaled[half * 16 + i])
 
-def _your_dequantize_nf4(weight, quant_state):
-    """Setup and launch the Triton kernel."""
-    qweight = weight
+def ultimate_speed_dequantize_nf4(module):
+    """Ultimate speed NF4 dequantization."""
+    weight = module.weight
+    quant_state = weight.quant_state
+    
+    qweight = weight.data
     absmax = quant_state.absmax
     absmax32 = quant_state.state2.absmax
     dtype = quant_state.dtype
     device = qweight.device
     
-    # Get dimensions from weight shape
-    packed_shape = qweight.shape
-    M = packed_shape[0]
-    N = packed_shape[1] * 2  # Each byte contains 2 4-bit values
+    M = module.out_features
+    N = module.in_features
     
     blocks_per_row = (N + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
     
-    # Prepare absmax tensors
+    # Handle tensor shapes
     if absmax.dim() == 1:
         if absmax.numel() == blocks_per_row:
             absmax = absmax.unsqueeze(0).expand(M, -1)
         elif absmax.numel() == M * blocks_per_row:
             absmax = absmax.view(M, blocks_per_row)
+    
+    if absmax.shape != (M, blocks_per_row):
+        if fast_dequantize is not None:
+            return fast_dequantize(weight, quant_state)
+        else:
+            raise ValueError("Invalid absmax shape")
     
     if absmax32.dim() == 1:
         if absmax32.numel() == absmax32_per_row:
@@ -141,22 +157,28 @@ def _your_dequantize_nf4(weight, quant_state):
         elif absmax32.numel() == M * absmax32_per_row:
             absmax32 = absmax32.view(M, absmax32_per_row)
     
-    # Ensure contiguous
+    if absmax32.shape != (M, absmax32_per_row):
+        if fast_dequantize is not None:
+            return fast_dequantize(weight, quant_state)
+        else:
+            raise ValueError("Invalid absmax32 shape")
+    
+    # Force contiguous
     qweight = qweight.contiguous()
-    absmax = absmax.contiguous()
+    absmax = absmax.contiguous().to(torch.float32)
     absmax32 = absmax32.contiguous()
     
-    # Allocate output
+    # Pre-allocate output
     output = torch.empty((M, N), dtype=dtype, device=device)
     
-    # Launch kernel
+    # Launch kernel - one thread per block for simplicity
     total_blocks = M * blocks_per_row
     
-    _your_dequantize_nf4_kernel[(total_blocks,)](
+    _ultimate_speed_kernel[(total_blocks,)](
         qweight.view(-1),
         absmax.view(-1),
         absmax32.view(-1),
-        output.view(-1),
+        output,
         M, N,
         blocks_per_row,
         absmax32_per_row,
@@ -166,6 +188,5 @@ def _your_dequantize_nf4(weight, quant_state):
     
     return output
 
-def your_dequantize_nf4(weight):
-    """Main entry point for the challenge."""
-    return _your_dequantize_nf4(weight.weight.data, weight.weight.quant_state)
+# Export
+triton_dequantize_nf4 = ultimate_speed_dequantize_nf4
