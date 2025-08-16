@@ -7,6 +7,25 @@ try:
 except ImportError:
     fast_dequantize = None
 
+try:
+    from .extreme_optimized import extreme_triton_dequantize_nf4 as extreme_optimized
+except ImportError:
+    extreme_optimized = None
+
+try:
+    from .optimized_kernel import optimized_triton_dequantize_nf4 as ultra_optimized
+except ImportError:
+    ultra_optimized = None
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=1, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=4, num_stages=3),
+    ],
+    key=['M', 'N'],
+)
 @triton.jit
 def _nf4_dequantize_kernel(
     qweight_ptr,
@@ -16,6 +35,7 @@ def _nf4_dequantize_kernel(
     M, N,
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """NF4 dequantization kernel."""
     
@@ -99,7 +119,21 @@ def _nf4_dequantize_kernel(
 
 def triton_dequantize_nf4(module):
     """NF4 dequantization using Triton."""
-    # Try fused optimized version first
+    # Try extreme-optimized version first
+    if extreme_optimized is not None:
+        try:
+            return extreme_optimized(module)
+        except Exception:
+            pass
+    
+    # Try ultra-optimized version
+    if ultra_optimized is not None:
+        try:
+            return ultra_optimized(module)
+        except Exception:
+            pass
+    
+    # Try fused optimized version
     try:
         from .fused_optimized import fused_triton_dequantize_nf4
         return fused_triton_dequantize_nf4(module)
@@ -164,8 +198,6 @@ def triton_dequantize_nf4(module):
         M, N,
         blocks_per_row,
         absmax32_per_row,
-        num_warps=1,
-        num_stages=1,
     )
     
     return output
