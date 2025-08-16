@@ -1,6 +1,6 @@
 """
-Minimal NF4 Triton Dequantization Kernel
-Simplified to isolate performance issues
+Optimized NF4 Triton Dequantization Kernel
+Ultra-optimized implementation using Triton's advanced features
 """
 
 import torch
@@ -8,124 +8,125 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _nf4_dequantize_kernel_simple(
+def _nf4_lookup(nibble):
+    """Optimized NF4 lookup using single expression."""
+    return tl.where(nibble == 0, -1.0,
+           tl.where(nibble == 1, -0.6961928009986877,
+           tl.where(nibble == 2, -0.5250730514526367,
+           tl.where(nibble == 3, -0.39491748809814453,
+           tl.where(nibble == 4, -0.28444138169288635,
+           tl.where(nibble == 5, -0.18477343022823334,
+           tl.where(nibble == 6, -0.09105003625154495,
+           tl.where(nibble == 7, 0.0,
+           tl.where(nibble == 8, 0.07958029955625534,
+           tl.where(nibble == 9, 0.16093020141124725,
+           tl.where(nibble == 10, 0.24611230194568634,
+           tl.where(nibble == 11, 0.33791524171829224,
+           tl.where(nibble == 12, 0.44070982933044434,
+           tl.where(nibble == 13, 0.5626170039176941,
+           tl.where(nibble == 14, 0.7229568362236023, 1.0)))))))))))))))
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 256}, num_warps=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 512}, num_warps=4),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 1024}, num_warps=8),
+        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 256}, num_warps=4),
+        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 512}, num_warps=8),
+        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 256}, num_warps=8),
+    ],
+    key=['m', 'n'],
+)
+@triton.jit
+def _nf4_dequant_kernel(
     qweight_ptr,
     absmax_ptr,
     absmax32_ptr,
     output_ptr,
     m, n,
-    blocks_per_row: tl.constexpr,
-    absmax32_per_row: tl.constexpr,
+    stride_qw_m, stride_qw_n,
+    stride_am_m, stride_am_n,
+    stride_a32_m, stride_a32_n,
+    stride_out_m, stride_out_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    """Simplest possible NF4 dequantization kernel."""
+    """Ultra-optimized NF4 dequantization with 2D tiling."""
     
-    pid = tl.program_id(0)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     
-    # Each program handles one NF4 block (64 elements)
-    row = pid // blocks_per_row
-    block_idx = pid % blocks_per_row
+    # Calculate block boundaries
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     
-    if row >= m:
-        return
+    # Create 2D mask
+    rm = tl.max_contiguous(tl.multiple_of(rm % m, BLOCK_M), BLOCK_M)
+    rn = tl.max_contiguous(tl.multiple_of(rn % n, BLOCK_N), BLOCK_N)
     
-    col_start = block_idx * 64
-    if col_start >= n:
-        return
+    mask_m = rm < m
+    mask_n = rn < n
     
-    # Load scales (double dequantization)
-    absmax = tl.load(absmax_ptr + row * blocks_per_row + block_idx).to(tl.float32)
-    absmax32 = tl.load(absmax32_ptr + row * absmax32_per_row + (block_idx >> 2)).to(tl.float32)
-    scale = absmax * 0.00787401574803149606 * absmax32
-    
-    # Base addresses
-    qweight_base = row * (n >> 1) + (col_start >> 1)
-    output_base = row * n + col_start
-    
-    # Process 32 bytes (64 nibbles)
-    for i in tl.static_range(32):
-        # Load one byte
-        packed = tl.load(qweight_ptr + qweight_base + i)
-        
-        # Extract nibbles
-        low = packed & 0xF
-        high = (packed >> 4) & 0xF
-        
-        # NF4 decode - simple if-else chain
-        # Low nibble
-        if low == 0:
-            low_val = -1.0
-        elif low == 1:
-            low_val = -0.6961928009986877
-        elif low == 2:
-            low_val = -0.5250730514526367
-        elif low == 3:
-            low_val = -0.39491748809814453
-        elif low == 4:
-            low_val = -0.28444138169288635
-        elif low == 5:
-            low_val = -0.18477343022823334
-        elif low == 6:
-            low_val = -0.09105003625154495
-        elif low == 7:
-            low_val = 0.0
-        elif low == 8:
-            low_val = 0.07958029955625534
-        elif low == 9:
-            low_val = 0.16093020141124725
-        elif low == 10:
-            low_val = 0.24611230194568634
-        elif low == 11:
-            low_val = 0.33791524171829224
-        elif low == 12:
-            low_val = 0.44070982933044434
-        elif low == 13:
-            low_val = 0.5626170039176941
-        elif low == 14:
-            low_val = 0.7229568362236023
-        else:
-            low_val = 1.0
-        
-        # High nibble
-        if high == 0:
-            high_val = -1.0
-        elif high == 1:
-            high_val = -0.6961928009986877
-        elif high == 2:
-            high_val = -0.5250730514526367
-        elif high == 3:
-            high_val = -0.39491748809814453
-        elif high == 4:
-            high_val = -0.28444138169288635
-        elif high == 5:
-            high_val = -0.18477343022823334
-        elif high == 6:
-            high_val = -0.09105003625154495
-        elif high == 7:
-            high_val = 0.0
-        elif high == 8:
-            high_val = 0.07958029955625534
-        elif high == 9:
-            high_val = 0.16093020141124725
-        elif high == 10:
-            high_val = 0.24611230194568634
-        elif high == 11:
-            high_val = 0.33791524171829224
-        elif high == 12:
-            high_val = 0.44070982933044434
-        elif high == 13:
-            high_val = 0.5626170039176941
-        elif high == 14:
-            high_val = 0.7229568362236023
-        else:
-            high_val = 1.0
-        
-        # Scale and store
-        tl.store(output_ptr + output_base + i * 2, low_val * scale)
-        tl.store(output_ptr + output_base + i * 2 + 1, high_val * scale)
+    # Process each row in the block
+    for row_idx in range(BLOCK_M):
+        row = pid_m * BLOCK_M + row_idx
+        if row >= m:
+            break
+            
+        # Process columns in chunks
+        for col_idx in range(0, BLOCK_N, 64):
+            col_start = pid_n * BLOCK_N + col_idx
+            if col_start >= n:
+                break
+                
+            # Load scale factors for this 64-element block
+            block_idx = col_start // 64
+            absmax_idx = row * stride_am_m + block_idx * stride_am_n
+            absmax32_idx = row * stride_a32_m + (block_idx // 4) * stride_a32_n
+            
+            absmax_val = tl.load(absmax_ptr + absmax_idx)
+            absmax32_val = tl.load(absmax32_ptr + absmax32_idx)
+            scale = absmax_val * 0.00787401574803149606 * absmax32_val
+            
+            # Process 32 packed bytes
+            packed_base = row * stride_qw_m + (col_start // 2) * stride_qw_n
+            packed_offsets = tl.arange(0, 32)
+            packed_mask = (col_start + packed_offsets * 2) < n
+            
+            packed_data = tl.load(
+                qweight_ptr + packed_base + packed_offsets,
+                mask=packed_mask,
+                other=0
+            )
+            
+            # Extract and dequantize
+            low = _nf4_lookup(packed_data & 0xF) * scale
+            high = _nf4_lookup((packed_data >> 4) & 0xF) * scale
+            
+            # Store results
+            output_base = row * stride_out_m + col_start * stride_out_n
+            
+            # Interleaved store
+            even_idx = packed_offsets * 2
+            odd_idx = even_idx + 1
+            
+            even_mask = (col_start + even_idx) < n
+            odd_mask = (col_start + odd_idx) < n
+            
+            tl.store(
+                output_ptr + output_base + even_idx,
+                low,
+                mask=even_mask
+            )
+            tl.store(
+                output_ptr + output_base + odd_idx,
+                high,
+                mask=odd_mask
+            )
 
 
 def triton_dequantize_nf4(module):
-    """Main NF4 dequantization function."""
+    """Main NF4 dequantization function with optimized launch configuration."""
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -154,7 +155,7 @@ def triton_dequantize_nf4(module):
         elif absmax32.numel() == m * absmax32_per_row:
             absmax32 = absmax32.view(m, absmax32_per_row)
     
-    # Ensure contiguous
+    # Ensure contiguous memory
     qweight = qweight.contiguous()
     absmax = absmax.contiguous()
     absmax32 = absmax32.contiguous()
@@ -162,18 +163,29 @@ def triton_dequantize_nf4(module):
     # Allocate output
     output = torch.empty((m, n), dtype=dtype, device=device)
     
-    # Launch kernel
-    total_blocks = m * blocks_per_row
-    _nf4_dequantize_kernel_simple[(total_blocks,)](
-        qweight.view(-1),
-        absmax.view(-1),
-        absmax32.view(-1),
-        output.view(-1),
+    # Get strides
+    stride_qw_m, stride_qw_n = qweight.stride()
+    stride_am_m, stride_am_n = absmax.stride()
+    stride_a32_m, stride_a32_n = absmax32.stride()
+    stride_out_m, stride_out_n = output.stride()
+    
+    # Launch with 2D grid
+    def grid(meta):
+        return (
+            triton.cdiv(m, meta['BLOCK_M']),
+            triton.cdiv(n, meta['BLOCK_N']),
+        )
+    
+    _nf4_dequant_kernel[grid](
+        qweight,
+        absmax,
+        absmax32,
+        output,
         m, n,
-        blocks_per_row,
-        absmax32_per_row,
-        num_warps=1,
-        num_stages=1,
+        stride_qw_m, stride_qw_n,
+        stride_am_m, stride_am_n,
+        stride_a32_m, stride_a32_n,
+        stride_out_m, stride_out_n,
     )
     
     return output
