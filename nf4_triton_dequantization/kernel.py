@@ -1,6 +1,6 @@
 """
-NF4 Triton Dequantization Challenge Solution
-Target: 1.15x speedup over Unsloth's fast_dequantize
+Optimized NF4 Triton Dequantization Kernel
+Single file containing the complete optimized implementation
 """
 
 import torch
@@ -17,7 +17,7 @@ import triton.language as tl
     key=['M', 'N'],
 )
 @triton.jit
-def _your_dequantize_nf4_kernel(
+def _nf4_dequantize_kernel(
     qweight_ptr,
     absmax_ptr,
     absmax32_ptr,
@@ -26,7 +26,7 @@ def _your_dequantize_nf4_kernel(
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
 ):
-    """Optimized single Triton kernel for NF4 dequantization with double dequant."""
+    """Optimized NF4 dequantization kernel with double dequant in single pass."""
     
     pid = tl.program_id(0)
     
@@ -41,21 +41,21 @@ def _your_dequantize_nf4_kernel(
     if col_start >= N:
         return
     
-    # Double dequantization: combine both scale factors
+    # Double dequantization - load both scale factors
     absmax_idx = row * blocks_per_row + block_in_row
     absmax_val = tl.load(absmax_ptr + absmax_idx, cache_modifier=".ca").to(tl.float32)
     
     absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
     absmax32_val = tl.load(absmax32_ptr + absmax32_idx, cache_modifier=".ca").to(tl.float32)
     
-    # Combined scale with NF4 constant (1/127)
+    # Combined scale (1/127 = 0.00787401574803149606)
     scale = absmax_val * 0.00787401574803149606 * absmax32_val
     
-    # Calculate base addresses
+    # Calculate addresses
     qweight_base = row * (N >> 1) + (col_start >> 1)
     output_base = row * N + col_start
     
-    # Vectorized load of 32 packed bytes
+    # Load 32 packed bytes (64 nibbles)
     packed = tl.load(qweight_ptr + qweight_base + tl.arange(0, 32), cache_modifier=".ca")
     
     # Extract nibbles
@@ -113,7 +113,7 @@ def _your_dequantize_nf4_kernel(
     low_scaled = low_vals * scale
     high_scaled = high_vals * scale
     
-    # Vectorized store with unrolling
+    # Store with unrolling for better performance
     for i in tl.static_range(32):
         idx = i * 2
         if col_start + idx < N:
@@ -122,49 +122,47 @@ def _your_dequantize_nf4_kernel(
             tl.store(output_ptr + output_base + idx + 1, high_scaled[i], cache_modifier=".wb")
 
 
-def _your_dequantize_nf4(weight, quant_state):
-    """Setup and launch the optimized Triton kernel."""
+def triton_dequantize_nf4(module):
+    """Main NF4 dequantization function."""
+    weight = module.weight
+    quant_state = weight.quant_state
     
-    qweight = weight
+    qweight = weight.data
     absmax = quant_state.absmax
     absmax32 = quant_state.state2.absmax
     dtype = quant_state.dtype
     device = qweight.device
     
-    # Determine matrix dimensions
-    packed_shape = qweight.shape
-    M = packed_shape[0]
-    N = packed_shape[1] * 2  # Each byte contains 2 4-bit values
+    M = module.out_features
+    N = module.in_features
     
     blocks_per_row = (N + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
     
-    # Handle tensor shapes for absmax
+    # Handle tensor shapes
     if absmax.dim() == 1:
         if absmax.numel() == blocks_per_row:
             absmax = absmax.unsqueeze(0).expand(M, -1)
         elif absmax.numel() == M * blocks_per_row:
             absmax = absmax.view(M, blocks_per_row)
     
-    # Handle tensor shapes for absmax32
     if absmax32.dim() == 1:
         if absmax32.numel() == absmax32_per_row:
             absmax32 = absmax32.unsqueeze(0).expand(M, -1)
         elif absmax32.numel() == M * absmax32_per_row:
             absmax32 = absmax32.view(M, absmax32_per_row)
     
-    # Ensure contiguous memory layout
+    # Ensure contiguous
     qweight = qweight.contiguous()
     absmax = absmax.contiguous()
     absmax32 = absmax32.contiguous()
     
-    # Allocate output tensor
+    # Allocate output
     output = torch.empty((M, N), dtype=dtype, device=device)
     
     # Launch kernel
     total_blocks = M * blocks_per_row
-    
-    _your_dequantize_nf4_kernel[(total_blocks,)](
+    _nf4_dequantize_kernel[(total_blocks,)](
         qweight.view(-1),
         absmax.view(-1),
         absmax32.view(-1),
@@ -175,18 +173,3 @@ def _your_dequantize_nf4(weight, quant_state):
     )
     
     return output
-
-
-def your_dequantize_nf4(weight):
-    """Main entry point for the challenge - dequantizes a Linear4bit weight."""
-    return _your_dequantize_nf4(weight.weight.data, weight.weight.quant_state)
-
-
-# Test the implementation (uncomment to use)
-# from unsloth.kernels.utils import fast_dequantize
-# def unsloth_dequantize(weight):
-#     return fast_dequantize(weight.weight, weight.weight.quant_state)
-# 
-# test_dequantize(your_dequantize_nf4)
-# speedup = test_dequantize(unsloth_dequantize) / test_dequantize(your_dequantize_nf4)
-# print(f"Speedup: {speedup:.4f}x")

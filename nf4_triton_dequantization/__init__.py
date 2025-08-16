@@ -1,14 +1,15 @@
-from nf4_triton_dequantization.dequantization import (
-    triton_dequantize_nf4,
-    optimized_triton_dequantize_nf4,
-    benchmark_fast_dequantize,
-    reset_triton_dequantize_state
-)
+"""NF4 Triton Dequantization Package"""
 
-try:
-    from nf4_triton_dequantization.extreme_optimized import extreme_triton_dequantize_nf4
-except ImportError:
-    extreme_triton_dequantize_nf4 = triton_dequantize_nf4
+from nf4_triton_dequantization.kernel import triton_dequantize_nf4
+
+# Aliases for compatibility
+optimized_triton_dequantize_nf4 = triton_dequantize_nf4
+benchmark_fast_dequantize = triton_dequantize_nf4
+extreme_triton_dequantize_nf4 = triton_dequantize_nf4
+
+def reset_triton_dequantize_state():
+    """Reset any cached state (not needed in simplified version)"""
+    pass
 
 __all__ = [
     "triton_dequantize_nf4",
