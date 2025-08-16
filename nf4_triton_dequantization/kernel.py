@@ -1,12 +1,23 @@
 """
 Optimized NF4 Triton Dequantization Kernel
-High-performance implementation for Tesla T4
+High-performance implementation with autotuning for Tesla T4
 """
 
 import torch
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=1),
+    ],
+    key=['m', 'n'],
+)
 @triton.jit
 def _nf4_dequantize_kernel(
     qweight_ptr,
@@ -17,7 +28,7 @@ def _nf4_dequantize_kernel(
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
 ):
-    """Optimized NF4 dequantization kernel."""
+    """Autotuned NF4 dequantization kernel."""
     
     pid = tl.program_id(0)
     
@@ -36,23 +47,23 @@ def _nf4_dequantize_kernel(
     absmax_idx = row * blocks_per_row + block_in_row
     absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
     
-    absmax = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
-    absmax32 = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
-    scale = absmax * 0.00787401574803149606 * absmax32
+    absmax_val = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
+    absmax32_val = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
+    scale = absmax_val * 0.00787401574803149606 * absmax32_val
     
     # Base addresses
-    qbase = row * (n >> 1) + (col_start >> 1)
-    obase = row * n + col_start
+    qweight_base = row * (n >> 1) + (col_start >> 1)
+    output_base = row * n + col_start
     
     # Load all 32 bytes at once
-    offs = tl.arange(0, 32)
-    packed = tl.load(qweight_ptr + qbase + offs)
+    offsets = tl.arange(0, 32)
+    packed = tl.load(qweight_ptr + qweight_base + offsets)
     
     # Extract nibbles
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # NF4 lookup
+    # NF4 lookup table
     low_vals = tl.where(low == 0, -1.0,
                tl.where(low == 1, -0.6961928009986877,
                tl.where(low == 2, -0.5250730514526367,
@@ -91,17 +102,15 @@ def _nf4_dequantize_kernel(
     
     # Store interleaved results
     for i in tl.static_range(32):
-        idx_low = i * 2
-        idx_high = idx_low + 1
-        
-        if col_start + idx_low < n:
-            tl.store(output_ptr + obase + idx_low, low_scaled[i])
-        if col_start + idx_high < n:
-            tl.store(output_ptr + obase + idx_high, high_scaled[i])
+        idx = i * 2
+        if col_start + idx < n:
+            tl.store(output_ptr + output_base + idx, low_scaled[i])
+        if col_start + idx + 1 < n:
+            tl.store(output_ptr + output_base + idx + 1, high_scaled[i])
 
 
 def triton_dequantize_nf4(module):
-    """Main NF4 dequantization function."""
+    """Main NF4 dequantization function with autotuning."""
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -149,8 +158,6 @@ def triton_dequantize_nf4(module):
         m, n,
         blocks_per_row,
         absmax32_per_row,
-        num_warps=8,
-        num_stages=3,
     )
     
     return output
