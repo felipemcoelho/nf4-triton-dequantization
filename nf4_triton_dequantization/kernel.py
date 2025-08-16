@@ -17,10 +17,11 @@ def _nf4_dequantize_kernel(
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
 ):
-    """Optimized NF4 kernel with fast lookup and coalesced access."""
+    """Optimized NF4 dequantization kernel."""
     
     pid = tl.program_id(0)
     
+    # Each block processes one 64-element NF4 block
     row = pid // blocks_per_row
     block_in_row = pid % blocks_per_row
     
@@ -43,7 +44,7 @@ def _nf4_dequantize_kernel(
     qbase = row * (n >> 1) + (col_start >> 1)
     obase = row * n + col_start
     
-    # Load all 32 bytes at once - coalesced access
+    # Load all 32 bytes at once
     offs = tl.arange(0, 32)
     packed = tl.load(qweight_ptr + qbase + offs)
     
@@ -51,7 +52,7 @@ def _nf4_dequantize_kernel(
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # NF4 lookup - proven working approach
+    # NF4 lookup
     low_vals = tl.where(low == 0, -1.0,
                tl.where(low == 1, -0.6961928009986877,
                tl.where(low == 2, -0.5250730514526367,
@@ -88,20 +89,19 @@ def _nf4_dequantize_kernel(
     low_scaled = low_vals * scale
     high_scaled = high_vals * scale
     
-    # Vectorized interleaved store
-    even_offs = offs * 2
-    odd_offs = even_offs + 1
-    
-    # Store with masking
-    even_mask = (col_start + even_offs) < n
-    odd_mask = (col_start + odd_offs) < n
-    
-    tl.store(output_ptr + obase + even_offs, low_scaled, mask=even_mask)
-    tl.store(output_ptr + obase + odd_offs, high_scaled, mask=odd_mask)
+    # Store interleaved results
+    for i in tl.static_range(32):
+        idx_low = i * 2
+        idx_high = idx_low + 1
+        
+        if col_start + idx_low < n:
+            tl.store(output_ptr + obase + idx_low, low_scaled[i])
+        if col_start + idx_high < n:
+            tl.store(output_ptr + obase + idx_high, high_scaled[i])
 
 
 def triton_dequantize_nf4(module):
-    """Main NF4 dequantization function optimized for performance."""
+    """Main NF4 dequantization function."""
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -138,7 +138,7 @@ def triton_dequantize_nf4(module):
     # Allocate output
     output = torch.empty((m, n), dtype=dtype, device=device)
     
-    # Launch kernel with optimal T4 configuration
+    # Launch kernel
     total_blocks = m * blocks_per_row
     
     _nf4_dequantize_kernel[(total_blocks,)](
@@ -149,8 +149,8 @@ def triton_dequantize_nf4(module):
         m, n,
         blocks_per_row,
         absmax32_per_row,
-        num_warps=4,
-        num_stages=2,
+        num_warps=8,
+        num_stages=3,
     )
     
     return output
