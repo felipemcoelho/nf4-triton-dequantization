@@ -1,6 +1,6 @@
 """
 Optimized NF4 Triton Dequantization Kernel
-Ultra-fast implementation for Tesla T4
+High-performance implementation for Tesla T4
 """
 
 import torch
@@ -17,7 +17,7 @@ def _nf4_dequantize_kernel(
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
 ):
-    """Ultra-optimized NF4 kernel with coalesced memory access."""
+    """Optimized NF4 kernel with fast lookup and coalesced access."""
     
     pid = tl.program_id(0)
     
@@ -31,7 +31,7 @@ def _nf4_dequantize_kernel(
     if col_start >= n:
         return
     
-    # Load scales
+    # Load scale factors
     absmax_idx = row * blocks_per_row + block_in_row
     absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
     
@@ -39,11 +39,11 @@ def _nf4_dequantize_kernel(
     absmax32 = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
     scale = absmax * 0.00787401574803149606 * absmax32
     
-    # Base pointers
+    # Base addresses
     qbase = row * (n >> 1) + (col_start >> 1)
     obase = row * n + col_start
     
-    # Load all 32 bytes at once for coalesced access
+    # Load all 32 bytes at once - coalesced access
     offs = tl.arange(0, 32)
     packed = tl.load(qweight_ptr + qbase + offs)
     
@@ -51,59 +51,57 @@ def _nf4_dequantize_kernel(
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # Optimized NF4 lookup using single expression
-    # Low nibbles
-    lv = tl.where(low < 8,
-         tl.where(low < 4,
-           tl.where(low < 2,
-             tl.where(low == 0, -1.0, -0.6961928009986877),
-             tl.where(low == 2, -0.5250730514526367, -0.39491748809814453)),
-           tl.where(low < 6,
-             tl.where(low == 4, -0.28444138169288635, -0.18477343022823334),
-             tl.where(low == 6, -0.09105003625154495, 0.0))),
-         tl.where(low < 12,
-           tl.where(low < 10,
-             tl.where(low == 8, 0.07958029955625534, 0.16093020141124725),
-             tl.where(low == 10, 0.24611230194568634, 0.33791524171829224)),
-           tl.where(low < 14,
-             tl.where(low == 12, 0.44070982933044434, 0.5626170039176941),
-             tl.where(low == 14, 0.7229568362236023, 1.0))))
+    # NF4 lookup - proven working approach
+    low_vals = tl.where(low == 0, -1.0,
+               tl.where(low == 1, -0.6961928009986877,
+               tl.where(low == 2, -0.5250730514526367,
+               tl.where(low == 3, -0.39491748809814453,
+               tl.where(low == 4, -0.28444138169288635,
+               tl.where(low == 5, -0.18477343022823334,
+               tl.where(low == 6, -0.09105003625154495,
+               tl.where(low == 7, 0.0,
+               tl.where(low == 8, 0.07958029955625534,
+               tl.where(low == 9, 0.16093020141124725,
+               tl.where(low == 10, 0.24611230194568634,
+               tl.where(low == 11, 0.33791524171829224,
+               tl.where(low == 12, 0.44070982933044434,
+               tl.where(low == 13, 0.5626170039176941,
+               tl.where(low == 14, 0.7229568362236023, 1.0)))))))))))))))
     
-    # High nibbles
-    hv = tl.where(high < 8,
-         tl.where(high < 4,
-           tl.where(high < 2,
-             tl.where(high == 0, -1.0, -0.6961928009986877),
-             tl.where(high == 2, -0.5250730514526367, -0.39491748809814453)),
-           tl.where(high < 6,
-             tl.where(high == 4, -0.28444138169288635, -0.18477343022823334),
-             tl.where(high == 6, -0.09105003625154495, 0.0))),
-         tl.where(high < 12,
-           tl.where(high < 10,
-             tl.where(high == 8, 0.07958029955625534, 0.16093020141124725),
-             tl.where(high == 10, 0.24611230194568634, 0.33791524171829224)),
-           tl.where(high < 14,
-             tl.where(high == 12, 0.44070982933044434, 0.5626170039176941),
-             tl.where(high == 14, 0.7229568362236023, 1.0))))
+    high_vals = tl.where(high == 0, -1.0,
+                tl.where(high == 1, -0.6961928009986877,
+                tl.where(high == 2, -0.5250730514526367,
+                tl.where(high == 3, -0.39491748809814453,
+                tl.where(high == 4, -0.28444138169288635,
+                tl.where(high == 5, -0.18477343022823334,
+                tl.where(high == 6, -0.09105003625154495,
+                tl.where(high == 7, 0.0,
+                tl.where(high == 8, 0.07958029955625534,
+                tl.where(high == 9, 0.16093020141124725,
+                tl.where(high == 10, 0.24611230194568634,
+                tl.where(high == 11, 0.33791524171829224,
+                tl.where(high == 12, 0.44070982933044434,
+                tl.where(high == 13, 0.5626170039176941,
+                tl.where(high == 14, 0.7229568362236023, 1.0)))))))))))))))
     
     # Apply scale
-    lv = lv * scale
-    hv = hv * scale
+    low_scaled = low_vals * scale
+    high_scaled = high_vals * scale
     
-    # Vectorized interleaved store using advanced indexing
-    # Store low values at even positions
+    # Vectorized interleaved store
     even_offs = offs * 2
-    even_mask = (col_start + even_offs) < n
-    tl.store(output_ptr + obase + even_offs, lv, mask=even_mask)
+    odd_offs = even_offs + 1
     
-    # Store high values at odd positions
-    odd_offs = offs * 2 + 1
+    # Store with masking
+    even_mask = (col_start + even_offs) < n
     odd_mask = (col_start + odd_offs) < n
-    tl.store(output_ptr + obase + odd_offs, hv, mask=odd_mask)
+    
+    tl.store(output_ptr + obase + even_offs, low_scaled, mask=even_mask)
+    tl.store(output_ptr + obase + odd_offs, high_scaled, mask=odd_mask)
 
 
 def triton_dequantize_nf4(module):
-    """Main NF4 dequantization function."""
+    """Main NF4 dequantization function optimized for performance."""
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -132,7 +130,7 @@ def triton_dequantize_nf4(module):
         elif absmax32.numel() == m * absmax32_per_row:
             absmax32 = absmax32.view(m, absmax32_per_row)
     
-    # Ensure contiguous
+    # Ensure contiguous memory
     qweight = qweight.contiguous()
     absmax = absmax.contiguous()
     absmax32 = absmax32.contiguous()
@@ -140,7 +138,7 @@ def triton_dequantize_nf4(module):
     # Allocate output
     output = torch.empty((m, n), dtype=dtype, device=device)
     
-    # Launch kernel
+    # Launch kernel with optimal T4 configuration
     total_blocks = m * blocks_per_row
     
     _nf4_dequantize_kernel[(total_blocks,)](
@@ -151,8 +149,8 @@ def triton_dequantize_nf4(module):
         m, n,
         blocks_per_row,
         absmax32_per_row,
-        num_warps=8,  # More warps for better occupancy
-        num_stages=1,  # Minimal stages for less overhead
+        num_warps=4,
+        num_stages=2,
     )
     
     return output
