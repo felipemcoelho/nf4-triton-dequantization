@@ -12,41 +12,45 @@ def _nf4_dequantize_kernel(
     absmax_ptr,
     absmax32_ptr,
     output_ptr,
-    M, N,
+    m, n,
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
 ):
-    """High-performance NF4 dequantization kernel."""
+    """Simple and fast NF4 dequantization kernel."""
     
     pid = tl.program_id(0)
     
     row = pid // blocks_per_row
     block_idx = pid % blocks_per_row
     
-    if row >= M:
+    if row >= m:
         return
     
     col_start = block_idx * 64
-    if col_start >= N:
+    if col_start >= n:
         return
     
     # Load scale factors
-    absmax = tl.load(absmax_ptr + row * blocks_per_row + block_idx).to(tl.float32)
-    absmax32 = tl.load(absmax32_ptr + row * absmax32_per_row + (block_idx >> 2)).to(tl.float32)
+    absmax_idx = row * blocks_per_row + block_idx
+    absmax = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
+    
+    absmax32_idx = row * absmax32_per_row + (block_idx >> 2)
+    absmax32 = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
+    
     scale = absmax * 0.00787401574803149606 * absmax32
     
-    # Calculate base addresses
-    qweight_base = row * (N >> 1) + (col_start >> 1)
-    output_base = row * N + col_start
+    # Base addresses
+    qweight_base = row * (n >> 1) + (col_start >> 1)
+    output_base = row * n + col_start
     
-    # Load 32 bytes (64 nibbles) at once
+    # Load 32 bytes
     packed = tl.load(qweight_ptr + qweight_base + tl.arange(0, 32))
     
     # Extract nibbles
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # NF4 lookup table
+    # NF4 lookup
     low_vals = tl.where(low == 0, -1.0,
                tl.where(low == 1, -0.6961928009986877,
                tl.where(low == 2, -0.5250730514526367,
@@ -79,17 +83,14 @@ def _nf4_dequantize_kernel(
                 tl.where(high == 13, 0.5626170039176941,
                 tl.where(high == 14, 0.7229568362236023, 1.0)))))))))))))))
     
-    # Scale values
+    # Scale
     low_scaled = low_vals * scale
     high_scaled = high_vals * scale
     
-    # Store interleaved - use static range for better optimization
+    # Store interleaved
     for i in tl.static_range(32):
-        idx = i * 2
-        if col_start + idx < N:
-            tl.store(output_ptr + output_base + idx, low_scaled[i])
-        if col_start + idx + 1 < N:
-            tl.store(output_ptr + output_base + idx + 1, high_scaled[i])
+        tl.store(output_ptr + output_base + i * 2, low_scaled[i])
+        tl.store(output_ptr + output_base + i * 2 + 1, high_scaled[i])
 
 
 def triton_dequantize_nf4(module):
@@ -103,24 +104,24 @@ def triton_dequantize_nf4(module):
     dtype = quant_state.dtype
     device = qweight.device
     
-    M = module.out_features
-    N = module.in_features
+    m = module.out_features
+    n = module.in_features
     
-    blocks_per_row = (N + 63) // 64
+    blocks_per_row = (n + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
     
     # Handle tensor shapes
     if absmax.dim() == 1:
         if absmax.numel() == blocks_per_row:
-            absmax = absmax.unsqueeze(0).expand(M, -1)
-        elif absmax.numel() == M * blocks_per_row:
-            absmax = absmax.view(M, blocks_per_row)
+            absmax = absmax.unsqueeze(0).expand(m, -1)
+        elif absmax.numel() == m * blocks_per_row:
+            absmax = absmax.view(m, blocks_per_row)
     
     if absmax32.dim() == 1:
         if absmax32.numel() == absmax32_per_row:
-            absmax32 = absmax32.unsqueeze(0).expand(M, -1)
-        elif absmax32.numel() == M * absmax32_per_row:
-            absmax32 = absmax32.view(M, absmax32_per_row)
+            absmax32 = absmax32.unsqueeze(0).expand(m, -1)
+        elif absmax32.numel() == m * absmax32_per_row:
+            absmax32 = absmax32.view(m, absmax32_per_row)
     
     # Ensure contiguous
     qweight = qweight.contiguous()
@@ -128,21 +129,20 @@ def triton_dequantize_nf4(module):
     absmax32 = absmax32.contiguous()
     
     # Allocate output
-    output = torch.empty((M, N), dtype=dtype, device=device)
+    output = torch.empty((m, n), dtype=dtype, device=device)
     
     # Launch kernel
-    total_blocks = M * blocks_per_row
-    
+    total_blocks = m * blocks_per_row
     _nf4_dequantize_kernel[(total_blocks,)](
         qweight.view(-1),
         absmax.view(-1),
         absmax32.view(-1),
         output.view(-1),
-        M, N,
+        m, n,
         blocks_per_row,
         absmax32_per_row,
-        num_warps=2,
-        num_stages=2,
+        num_warps=1,
+        num_stages=1,
     )
     
     return output
