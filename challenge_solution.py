@@ -7,15 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=2, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=3),
-    ],
-    key=['M', 'N'],
-)
 @triton.jit
 def _your_dequantize_nf4_kernel(
     qweight_ptr,
@@ -43,10 +34,10 @@ def _your_dequantize_nf4_kernel(
     
     # Double dequantization: combine both scale factors
     absmax_idx = row * blocks_per_row + block_in_row
-    absmax_val = tl.load(absmax_ptr + absmax_idx, cache_modifier=".ca").to(tl.float32)
+    absmax_val = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
     
     absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
-    absmax32_val = tl.load(absmax32_ptr + absmax32_idx, cache_modifier=".ca").to(tl.float32)
+    absmax32_val = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
     
     # Combined scale with NF4 constant (1/127)
     scale = absmax_val * 0.00787401574803149606 * absmax32_val
@@ -56,70 +47,56 @@ def _your_dequantize_nf4_kernel(
     output_base = row * N + col_start
     
     # Vectorized load of 32 packed bytes
-    packed = tl.load(qweight_ptr + qweight_base + tl.arange(0, 32), cache_modifier=".ca")
+    packed = tl.load(qweight_ptr + qweight_base + tl.arange(0, 32))
     
     # Extract nibbles
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # Optimized NF4 lookup using balanced binary tree
-    low_vals = tl.where(low < 8,
-        tl.where(low < 4,
-            tl.where(low < 2,
-                tl.where(low == 0, -1.0, -0.6961928009986877),
-                tl.where(low == 2, -0.5250730514526367, -0.39491748809814453)
-            ),
-            tl.where(low < 6,
-                tl.where(low == 4, -0.28444138169288635, -0.18477343022823334),
-                tl.where(low == 6, -0.09105003625154495, 0.0)
-            )
-        ),
-        tl.where(low < 12,
-            tl.where(low < 10,
-                tl.where(low == 8, 0.07958029955625534, 0.16093020141124725),
-                tl.where(low == 10, 0.24611230194568634, 0.33791524171829224)
-            ),
-            tl.where(low < 14,
-                tl.where(low == 12, 0.44070982933044434, 0.5626170039176941),
-                tl.where(low == 14, 0.7229568362236023, 1.0)
-            )
-        )
-    )
+    # NF4 lookup - standard approach
+    low_vals = tl.where(low == 0, -1.0,
+               tl.where(low == 1, -0.6961928009986877,
+               tl.where(low == 2, -0.5250730514526367,
+               tl.where(low == 3, -0.39491748809814453,
+               tl.where(low == 4, -0.28444138169288635,
+               tl.where(low == 5, -0.18477343022823334,
+               tl.where(low == 6, -0.09105003625154495,
+               tl.where(low == 7, 0.0,
+               tl.where(low == 8, 0.07958029955625534,
+               tl.where(low == 9, 0.16093020141124725,
+               tl.where(low == 10, 0.24611230194568634,
+               tl.where(low == 11, 0.33791524171829224,
+               tl.where(low == 12, 0.44070982933044434,
+               tl.where(low == 13, 0.5626170039176941,
+               tl.where(low == 14, 0.7229568362236023, 1.0)))))))))))))))
     
-    high_vals = tl.where(high < 8,
-        tl.where(high < 4,
-            tl.where(high < 2,
-                tl.where(high == 0, -1.0, -0.6961928009986877),
-                tl.where(high == 2, -0.5250730514526367, -0.39491748809814453)
-            ),
-            tl.where(high < 6,
-                tl.where(high == 4, -0.28444138169288635, -0.18477343022823334),
-                tl.where(high == 6, -0.09105003625154495, 0.0)
-            )
-        ),
-        tl.where(high < 12,
-            tl.where(high < 10,
-                tl.where(high == 8, 0.07958029955625534, 0.16093020141124725),
-                tl.where(high == 10, 0.24611230194568634, 0.33791524171829224)
-            ),
-            tl.where(high < 14,
-                tl.where(high == 12, 0.44070982933044434, 0.5626170039176941),
-                tl.where(high == 14, 0.7229568362236023, 1.0)
-            )
-        )
-    )
+    high_vals = tl.where(high == 0, -1.0,
+                tl.where(high == 1, -0.6961928009986877,
+                tl.where(high == 2, -0.5250730514526367,
+                tl.where(high == 3, -0.39491748809814453,
+                tl.where(high == 4, -0.28444138169288635,
+                tl.where(high == 5, -0.18477343022823334,
+                tl.where(high == 6, -0.09105003625154495,
+                tl.where(high == 7, 0.0,
+                tl.where(high == 8, 0.07958029955625534,
+                tl.where(high == 9, 0.16093020141124725,
+                tl.where(high == 10, 0.24611230194568634,
+                tl.where(high == 11, 0.33791524171829224,
+                tl.where(high == 12, 0.44070982933044434,
+                tl.where(high == 13, 0.5626170039176941,
+                tl.where(high == 14, 0.7229568362236023, 1.0)))))))))))))))
     
     # Apply scale
     low_scaled = low_vals * scale
     high_scaled = high_vals * scale
     
-    # Vectorized store with unrolling
-    for i in tl.static_range(32):
+    # Vectorized store
+    for i in range(32):
         idx = i * 2
         if col_start + idx < N:
-            tl.store(output_ptr + output_base + idx, low_scaled[i], cache_modifier=".wb")
+            tl.store(output_ptr + output_base + idx, low_scaled[i])
         if col_start + idx + 1 < N:
-            tl.store(output_ptr + output_base + idx + 1, high_scaled[i], cache_modifier=".wb")
+            tl.store(output_ptr + output_base + idx + 1, high_scaled[i])
 
 
 def _your_dequantize_nf4(weight, quant_state):
@@ -172,6 +149,8 @@ def _your_dequantize_nf4(weight, quant_state):
         M, N,
         blocks_per_row,
         absmax32_per_row,
+        num_warps=2,
+        num_stages=2,
     )
     
     return output
@@ -180,13 +159,3 @@ def _your_dequantize_nf4(weight, quant_state):
 def your_dequantize_nf4(weight):
     """Main entry point for the challenge - dequantizes a Linear4bit weight."""
     return _your_dequantize_nf4(weight.weight.data, weight.weight.quant_state)
-
-
-# Test the implementation (uncomment to use)
-# from unsloth.kernels.utils import fast_dequantize
-# def unsloth_dequantize(weight):
-#     return fast_dequantize(weight.weight, weight.weight.quant_state)
-# 
-# test_dequantize(your_dequantize_nf4)
-# speedup = test_dequantize(unsloth_dequantize) / test_dequantize(your_dequantize_nf4)
-# print(f"Speedup: {speedup:.4f}x")
