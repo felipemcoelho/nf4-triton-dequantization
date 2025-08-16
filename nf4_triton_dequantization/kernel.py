@@ -16,7 +16,7 @@ def _nf4_dequantize_kernel(
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
 ):
-    """Simple and fast NF4 dequantization kernel."""
+    """Simple NF4 dequantization kernel."""
     
     pid = tl.program_id(0)
     
@@ -30,7 +30,7 @@ def _nf4_dequantize_kernel(
     if col_start >= n:
         return
     
-    # Load scale factors
+    # Load scale factors - double dequantization
     absmax_idx = row * blocks_per_row + block_idx
     absmax = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
     
@@ -50,7 +50,7 @@ def _nf4_dequantize_kernel(
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # NF4 lookup
+    # NF4 lookup - simplified
     low_vals = tl.where(low == 0, -1.0,
                tl.where(low == 1, -0.6961928009986877,
                tl.where(low == 2, -0.5250730514526367,
@@ -87,7 +87,7 @@ def _nf4_dequantize_kernel(
     low_scaled = low_vals * scale
     high_scaled = high_vals * scale
     
-    # Store interleaved
+    # Store interleaved using static range
     for i in tl.static_range(32):
         tl.store(output_ptr + output_base + i * 2, low_scaled[i])
         tl.store(output_ptr + output_base + i * 2 + 1, high_scaled[i])
