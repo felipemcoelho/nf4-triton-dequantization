@@ -1,6 +1,6 @@
 """
 Optimized NF4 Triton Dequantization Kernel
-Production-ready implementation
+Production-ready implementation with fixed indexing
 """
 
 import torch
@@ -92,13 +92,15 @@ def _nf4_dequantize_kernel(
     low_scaled = low_vals * scale
     high_scaled = high_vals * scale
     
-    # Interleaved store
-    for i in tl.static_range(32):
-        idx = i * 2
-        if col_start + idx < n:
-            tl.store(output_ptr + output_base + idx, low_scaled[i])
-        if col_start + idx + 1 < n:
-            tl.store(output_ptr + output_base + idx + 1, high_scaled[i])
+    # Vectorized interleaved store
+    even_offs = offsets * 2
+    odd_offs = even_offs + 1
+    
+    even_mask = (col_start + even_offs) < n
+    odd_mask = (col_start + odd_offs) < n
+    
+    tl.store(output_ptr + output_base + even_offs, low_scaled, mask=even_mask)
+    tl.store(output_ptr + output_base + odd_offs, high_scaled, mask=odd_mask)
 
 
 def triton_dequantize_nf4(module):
@@ -142,18 +144,7 @@ def triton_dequantize_nf4(module):
     # Launch kernel
     total_blocks = m * blocks_per_row
     
-    # Use cached kernel configuration
-    cache_key = (m, n, blocks_per_row, absmax32_per_row)
-    if cache_key not in _kernel_cache:
-        _kernel_cache[cache_key] = {
-            'grid': (total_blocks,),
-            'num_warps': 2,
-            'num_stages': 2
-        }
-    
-    config = _kernel_cache[cache_key]
-    
-    _nf4_dequantize_kernel[config['grid']](
+    _nf4_dequantize_kernel[(total_blocks,)](
         qweight.view(-1),
         absmax.view(-1),
         absmax32.view(-1),
@@ -161,8 +152,8 @@ def triton_dequantize_nf4(module):
         m, n,
         blocks_per_row,
         absmax32_per_row,
-        num_warps=config['num_warps'],
-        num_stages=config['num_stages'],
+        num_warps=2,
+        num_stages=2,
     )
     
     return output
@@ -174,13 +165,12 @@ def reset_triton_dequantize_state():
     _kernel_cache = {}
 
 
-# Pure PyTorch fallback implementation
+# Fixed Pure PyTorch fallback implementation
 def pure_torch_fallback(module):
     """
     Pure PyTorch fallback for environments where Triton is slow
+    Fixed version with correct scale application
     """
-    import torch
-    
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -206,25 +196,60 @@ def pure_torch_fallback(module):
     
     # Reshape scales
     if absmax.dim() == 1:
-        absmax = absmax.view(m, -1) if absmax.numel() == m * blocks_per_row else absmax.unsqueeze(0).expand(m, -1)
+        if absmax.numel() == blocks_per_row:
+            absmax = absmax.unsqueeze(0).expand(m, -1)
+        elif absmax.numel() == m * blocks_per_row:
+            absmax = absmax.view(m, blocks_per_row)
+    
     if absmax32.dim() == 1:
-        absmax32 = absmax32.view(m, -1) if absmax32.numel() == m * absmax32_per_row else absmax32.unsqueeze(0).expand(m, -1)
+        if absmax32.numel() == absmax32_per_row:
+            absmax32 = absmax32.unsqueeze(0).expand(m, -1)
+        elif absmax32.numel() == m * absmax32_per_row:
+            absmax32 = absmax32.view(m, absmax32_per_row)
     
-    # Extract nibbles
+    # Ensure contiguous and convert to float for scale calculation
+    qweight = qweight.contiguous()
+    absmax = absmax.contiguous().float()
+    absmax32 = absmax32.contiguous().float()
+    
+    # Extract nibbles from all bytes at once
     qweight_int = qweight.to(torch.int32)
-    low = lut[(qweight_int & 0xF).long()].view(m, -1)
-    high = lut[((qweight_int >> 4) & 0xF).long()].view(m, -1)
+    low_nibbles = (qweight_int & 0xF).long()
+    high_nibbles = ((qweight_int >> 4) & 0xF).long()
     
-    # Interleave
+    # Lookup NF4 values
+    low_vals = lut[low_nibbles]
+    high_vals = lut[high_nibbles]
+    
+    # Create output tensor
     output = torch.empty((m, n), dtype=dtype, device=device)
-    output[:, 0::2] = low[:, :n//2]
-    output[:, 1::2] = high[:, :n//2]
     
-    # Apply scales
-    col_to_block = torch.arange(n, device=device) // 64
-    col_to_absmax32 = col_to_block // 4
-    
-    scales = absmax[:, col_to_block].float() * 0.00787401574803149606 * absmax32[:, col_to_absmax32].float()
-    output *= scales.to(dtype)
+    # Process each row
+    for row in range(m):
+        row_low = low_vals[row]
+        row_high = high_vals[row]
+        
+        # Interleave values for this row
+        row_output = torch.empty(n, dtype=torch.float32, device=device)
+        row_output[0::2] = row_low[:n//2]
+        row_output[1::2] = row_high[:n//2]
+        
+        # Apply scales block by block
+        for block_idx in range(blocks_per_row):
+            col_start = block_idx * 64
+            col_end = min(col_start + 64, n)
+            
+            # Get scale factors for this block
+            absmax_val = absmax[row, block_idx]
+            absmax32_val = absmax32[row, block_idx // 4]
+            
+            # Combined scale
+            scale = absmax_val * 0.00787401574803149606 * absmax32_val
+            
+            # Apply scale to this block
+            row_output[col_start:col_end] *= scale
+        
+        # Store row
+        output[row] = row_output.to(dtype)
     
     return output
