@@ -164,18 +164,36 @@ def fast_pytorch_dequantize(module):
         0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
     ], dtype=torch.float32, device=device)
     
-    # Reshape scales efficiently
+    # Reshape scales efficiently - handle both flattened and already shaped tensors
     if absmax.dim() == 1:
-        if absmax.numel() == blocks_per_row:
-            absmax = absmax.unsqueeze(0).expand(m, -1)
-        elif absmax.numel() == m * blocks_per_row:
+        total_blocks = m * blocks_per_row
+        if absmax.numel() == total_blocks:
+            # Flattened tensor with all blocks - reshape to [m, blocks_per_row]
             absmax = absmax.view(m, blocks_per_row)
+        elif absmax.numel() == blocks_per_row:
+            # Single row of blocks - expand to all rows
+            absmax = absmax.unsqueeze(0).expand(m, -1)
+        else:
+            # Unexpected size - try to reshape anyway
+            absmax = absmax.view(m, -1)
+    elif absmax.dim() == 2:
+        # Already shaped correctly
+        pass
     
     if absmax32.dim() == 1:
-        if absmax32.numel() == absmax32_per_row:
-            absmax32 = absmax32.unsqueeze(0).expand(m, -1)
-        elif absmax32.numel() == m * absmax32_per_row:
+        total_absmax32 = m * absmax32_per_row
+        if absmax32.numel() == total_absmax32:
+            # Flattened tensor with all absmax32 - reshape to [m, absmax32_per_row]
             absmax32 = absmax32.view(m, absmax32_per_row)
+        elif absmax32.numel() == absmax32_per_row:
+            # Single row of absmax32 - expand to all rows
+            absmax32 = absmax32.unsqueeze(0).expand(m, -1)
+        else:
+            # Unexpected size - try to reshape anyway
+            absmax32 = absmax32.view(m, -1)
+    elif absmax32.dim() == 2:
+        # Already shaped correctly
+        pass
     
     # Convert to float32 for computation
     absmax_f32 = absmax.to(torch.float32)
@@ -259,18 +277,24 @@ def triton_dequantize_nf4(module):
         blocks_per_row = (n + 63) // 64
         absmax32_per_row = (blocks_per_row + 3) // 4
         
-        # Handle tensor shapes
+        # Handle tensor shapes - same logic as PyTorch version
         if absmax.dim() == 1:
-            if absmax.numel() == blocks_per_row:
-                absmax = absmax.unsqueeze(0).expand(m, -1)
-            elif absmax.numel() == m * blocks_per_row:
+            total_blocks = m * blocks_per_row
+            if absmax.numel() == total_blocks:
                 absmax = absmax.view(m, blocks_per_row)
+            elif absmax.numel() == blocks_per_row:
+                absmax = absmax.unsqueeze(0).expand(m, -1)
+            else:
+                absmax = absmax.view(m, -1)
         
         if absmax32.dim() == 1:
-            if absmax32.numel() == absmax32_per_row:
-                absmax32 = absmax32.unsqueeze(0).expand(m, -1)
-            elif absmax32.numel() == m * absmax32_per_row:
+            total_absmax32 = m * absmax32_per_row
+            if absmax32.numel() == total_absmax32:
                 absmax32 = absmax32.view(m, absmax32_per_row)
+            elif absmax32.numel() == absmax32_per_row:
+                absmax32 = absmax32.unsqueeze(0).expand(m, -1)
+            else:
+                absmax32 = absmax32.view(m, -1)
         
         # Ensure contiguous
         qweight = qweight.contiguous()
