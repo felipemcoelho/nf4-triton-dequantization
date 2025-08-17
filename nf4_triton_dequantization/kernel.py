@@ -31,24 +31,28 @@ def _nf4_dequantize_kernel(
     if col_start >= n:
         return
     
-    # Load scales
-    absmax = tl.load(absmax_ptr + row * blocks_per_row + block_in_row).to(tl.float32)
-    absmax32 = tl.load(absmax32_ptr + row * absmax32_per_row + (block_in_row >> 2)).to(tl.float32)
-    scale = absmax * 0.00787401574803149606 * absmax32
+    # Load scale factors
+    absmax_idx = row * blocks_per_row + block_in_row
+    absmax_val = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
+    
+    absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
+    absmax32_val = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
+    
+    scale = absmax_val * 0.00787401574803149606 * absmax32_val
     
     # Base addresses
-    qbase = row * (n >> 1) + (col_start >> 1)
-    obase = row * n + col_start
+    qweight_base = row * (n >> 1) + (col_start >> 1)
+    output_base = row * n + col_start
     
-    # Load and process all 32 bytes
-    offs = tl.arange(0, 32)
-    packed = tl.load(qweight_ptr + qbase + offs)
+    # Load all 32 bytes at once
+    offsets = tl.arange(0, 32)
+    packed = tl.load(qweight_ptr + qweight_base + offsets)
     
     # Extract nibbles
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # NF4 lookup - optimized
+    # NF4 lookup table
     low_vals = tl.where(low == 0, -1.0,
                tl.where(low == 1, -0.6961928009986877,
                tl.where(low == 2, -0.5250730514526367,
@@ -85,15 +89,13 @@ def _nf4_dequantize_kernel(
     low_scaled = low_vals * scale
     high_scaled = high_vals * scale
     
-    # Vectorized store
-    even_offs = offs * 2
-    odd_offs = even_offs + 1
-    
-    even_mask = (col_start + even_offs) < n
-    odd_mask = (col_start + odd_offs) < n
-    
-    tl.store(output_ptr + obase + even_offs, low_scaled, mask=even_mask)
-    tl.store(output_ptr + obase + odd_offs, high_scaled, mask=odd_mask)
+    # Store interleaved results
+    for i in tl.static_range(32):
+        idx = i * 2
+        if col_start + idx < n:
+            tl.store(output_ptr + output_base + idx, low_scaled[i])
+        if col_start + idx + 1 < n:
+            tl.store(output_ptr + output_base + idx + 1, high_scaled[i])
 
 
 def triton_dequantize_nf4(module):
@@ -134,7 +136,7 @@ def triton_dequantize_nf4(module):
     # Allocate output
     output = torch.empty((m, n), dtype=dtype, device=device)
     
-    # Launch kernel
+    # Launch kernel with optimal configuration
     total_blocks = m * blocks_per_row
     
     _nf4_dequantize_kernel[(total_blocks,)](
@@ -145,8 +147,8 @@ def triton_dequantize_nf4(module):
         m, n,
         blocks_per_row,
         absmax32_per_row,
-        num_warps=1,
-        num_stages=1,
+        num_warps=2,
+        num_stages=2,
     )
     
     return output
