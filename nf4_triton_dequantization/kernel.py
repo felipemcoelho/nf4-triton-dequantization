@@ -1,11 +1,14 @@
 """
 Optimized NF4 Triton Dequantization Kernel
-Fast implementation for Tesla T4
+Production-ready implementation
 """
 
 import torch
 import triton
 import triton.language as tl
+
+# Cache the compiled kernel
+_kernel_cache = {}
 
 @triton.jit
 def _nf4_dequantize_kernel(
@@ -17,7 +20,7 @@ def _nf4_dequantize_kernel(
     blocks_per_row: tl.constexpr,
     absmax32_per_row: tl.constexpr,
 ):
-    """Fast NF4 dequantization kernel."""
+    """Optimized NF4 dequantization kernel."""
     
     pid = tl.program_id(0)
     
@@ -44,7 +47,7 @@ def _nf4_dequantize_kernel(
     qweight_base = row * (n >> 1) + (col_start >> 1)
     output_base = row * n + col_start
     
-    # Load all 32 bytes at once
+    # Load 32 bytes
     offsets = tl.arange(0, 32)
     packed = tl.load(qweight_ptr + qweight_base + offsets)
     
@@ -52,7 +55,7 @@ def _nf4_dequantize_kernel(
     low = packed & 0xF
     high = (packed >> 4) & 0xF
     
-    # NF4 lookup table
+    # NF4 lookup
     low_vals = tl.where(low == 0, -1.0,
                tl.where(low == 1, -0.6961928009986877,
                tl.where(low == 2, -0.5250730514526367,
@@ -85,11 +88,11 @@ def _nf4_dequantize_kernel(
                 tl.where(high == 13, 0.5626170039176941,
                 tl.where(high == 14, 0.7229568362236023, 1.0)))))))))))))))
     
-    # Apply scale
+    # Apply scale and store
     low_scaled = low_vals * scale
     high_scaled = high_vals * scale
     
-    # Store interleaved results
+    # Interleaved store
     for i in tl.static_range(32):
         idx = i * 2
         if col_start + idx < n:
@@ -99,7 +102,7 @@ def _nf4_dequantize_kernel(
 
 
 def triton_dequantize_nf4(module):
-    """Main NF4 dequantization function."""
+    """Main NF4 dequantization with kernel caching."""
     weight = module.weight
     quant_state = weight.quant_state
     
@@ -128,7 +131,7 @@ def triton_dequantize_nf4(module):
         elif absmax32.numel() == m * absmax32_per_row:
             absmax32 = absmax32.view(m, absmax32_per_row)
     
-    # Ensure contiguous memory
+    # Ensure contiguous
     qweight = qweight.contiguous()
     absmax = absmax.contiguous()
     absmax32 = absmax32.contiguous()
@@ -136,10 +139,21 @@ def triton_dequantize_nf4(module):
     # Allocate output
     output = torch.empty((m, n), dtype=dtype, device=device)
     
-    # Launch kernel with optimal configuration
+    # Launch kernel
     total_blocks = m * blocks_per_row
     
-    _nf4_dequantize_kernel[(total_blocks,)](
+    # Use cached kernel configuration
+    cache_key = (m, n, blocks_per_row, absmax32_per_row)
+    if cache_key not in _kernel_cache:
+        _kernel_cache[cache_key] = {
+            'grid': (total_blocks,),
+            'num_warps': 2,
+            'num_stages': 2
+        }
+    
+    config = _kernel_cache[cache_key]
+    
+    _nf4_dequantize_kernel[config['grid']](
         qweight.view(-1),
         absmax.view(-1),
         absmax32.view(-1),
@@ -147,8 +161,14 @@ def triton_dequantize_nf4(module):
         m, n,
         blocks_per_row,
         absmax32_per_row,
-        num_warps=2,
-        num_stages=2,
+        num_warps=config['num_warps'],
+        num_stages=config['num_stages'],
     )
     
     return output
+
+
+def reset_triton_dequantize_state():
+    """Reset kernel cache."""
+    global _kernel_cache
+    _kernel_cache = {}
