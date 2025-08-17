@@ -172,3 +172,59 @@ def reset_triton_dequantize_state():
     """Reset kernel cache."""
     global _kernel_cache
     _kernel_cache = {}
+
+
+# Pure PyTorch fallback implementation
+def pure_torch_fallback(module):
+    """
+    Pure PyTorch fallback for environments where Triton is slow
+    """
+    import torch
+    
+    weight = module.weight
+    quant_state = weight.quant_state
+    
+    qweight = weight.data
+    absmax = quant_state.absmax
+    absmax32 = quant_state.state2.absmax
+    dtype = quant_state.dtype
+    device = qweight.device
+    
+    m = module.out_features
+    n = module.in_features
+    
+    # NF4 lookup table
+    lut = torch.tensor([
+        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+    ], dtype=torch.float32, device=device)
+    
+    blocks_per_row = (n + 63) // 64
+    absmax32_per_row = (blocks_per_row + 3) // 4
+    
+    # Reshape scales
+    if absmax.dim() == 1:
+        absmax = absmax.view(m, -1) if absmax.numel() == m * blocks_per_row else absmax.unsqueeze(0).expand(m, -1)
+    if absmax32.dim() == 1:
+        absmax32 = absmax32.view(m, -1) if absmax32.numel() == m * absmax32_per_row else absmax32.unsqueeze(0).expand(m, -1)
+    
+    # Extract nibbles
+    qweight_int = qweight.to(torch.int32)
+    low = lut[(qweight_int & 0xF).long()].view(m, -1)
+    high = lut[((qweight_int >> 4) & 0xF).long()].view(m, -1)
+    
+    # Interleave
+    output = torch.empty((m, n), dtype=dtype, device=device)
+    output[:, 0::2] = low[:, :n//2]
+    output[:, 1::2] = high[:, :n//2]
+    
+    # Apply scales
+    col_to_block = torch.arange(n, device=device) // 64
+    col_to_absmax32 = col_to_block // 4
+    
+    scales = absmax[:, col_to_block].float() * 0.00787401574803149606 * absmax32[:, col_to_absmax32].float()
+    output *= scales.to(dtype)
+    
+    return output
