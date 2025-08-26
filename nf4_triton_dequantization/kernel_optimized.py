@@ -137,25 +137,26 @@ def _nf4_dequantize_fused(
 
 def fast_pytorch_dequantize(module):
     """
-    Highly optimized pure PyTorch implementation
-    Uses vectorized operations and minimal memory allocation
+    Fully vectorized pure-PyTorch NF4 dequantization.
+    - Vectorized nibble extraction and LUT lookup.
+    - Vectorized double scaling (absmax and absmax32) without Python loops.
     """
     weight = module.weight
     quant_state = weight.quant_state
-    
+
     qweight = weight.data  # [m, n//2]
     absmax = quant_state.absmax
     absmax32 = quant_state.state2.absmax
     dtype = quant_state.dtype
     device = qweight.device
-    
+
     m = module.out_features
     n = module.in_features
-    
+
     # Pre-compute constants
     blocks_per_row = (n + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
-    
+
     # NF4 lookup table on correct device
     nf4_lut = torch.tensor([
         -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
@@ -163,81 +164,56 @@ def fast_pytorch_dequantize(module):
         0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
         0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
     ], dtype=torch.float32, device=device)
-    
-    # Reshape scales efficiently - handle both flattened and already shaped tensors
+
+    # Reshape scales efficiently - handle flattened or per-row tensors
     if absmax.dim() == 1:
         total_blocks = m * blocks_per_row
         if absmax.numel() == total_blocks:
-            # Flattened tensor with all blocks - reshape to [m, blocks_per_row]
             absmax = absmax.view(m, blocks_per_row)
         elif absmax.numel() == blocks_per_row:
-            # Single row of blocks - expand to all rows
             absmax = absmax.unsqueeze(0).expand(m, -1)
         else:
-            # Unexpected size - try to reshape anyway
             absmax = absmax.view(m, -1)
-    elif absmax.dim() == 2:
-        # Already shaped correctly
-        pass
-    
     if absmax32.dim() == 1:
         total_absmax32 = m * absmax32_per_row
         if absmax32.numel() == total_absmax32:
-            # Flattened tensor with all absmax32 - reshape to [m, absmax32_per_row]
             absmax32 = absmax32.view(m, absmax32_per_row)
         elif absmax32.numel() == absmax32_per_row:
-            # Single row of absmax32 - expand to all rows
             absmax32 = absmax32.unsqueeze(0).expand(m, -1)
         else:
-            # Unexpected size - try to reshape anyway
             absmax32 = absmax32.view(m, -1)
-    elif absmax32.dim() == 2:
-        # Already shaped correctly
-        pass
-    
+
     # Convert to float32 for computation
     absmax_f32 = absmax.to(torch.float32)
     absmax32_f32 = absmax32.to(torch.float32)
-    
-    # Fully vectorized extraction and lookup
-    qweight_int = qweight.to(torch.int32)
-    
-    # Extract all nibbles at once
-    low_nibbles = (qweight_int & 0xF).long()
-    high_nibbles = ((qweight_int >> 4) & 0xF).long()
-    
-    # Lookup all values at once
+
+    # Vectorized extraction and lookup
+    # Work with uint8 bytes to minimize conversions
+    if qweight.dtype == torch.uint8:
+        qbytes = qweight
+    else:
+        qbytes = qweight.to(torch.uint8)
+
+    low_nibbles = (qbytes & 0xF).to(torch.long)
+    high_nibbles = ((qbytes >> 4) & 0xF).to(torch.long)
+
     low_values = nf4_lut[low_nibbles]
     high_values = nf4_lut[high_nibbles]
-    
-    # Pre-allocate output
+
+    # Pre-allocate output in float32, then cast to target dtype
     output = torch.empty((m, n), dtype=torch.float32, device=device)
-    
-    # Interleave values efficiently
     output[:, 0::2] = low_values
     output[:, 1::2] = high_values
-    
-    # Apply scales using broadcasting
-    # Create expanded scale tensors for all blocks
-    scale_expanded = torch.zeros((m, blocks_per_row), dtype=torch.float32, device=device)
-    
-    # Compute all scales at once
-    for i in range(absmax32_per_row):
-        start_block = i * 4
-        end_block = min(start_block + 4, blocks_per_row)
-        if start_block < blocks_per_row:
-            scale_expanded[:, start_block:end_block] = (
-                absmax_f32[:, start_block:end_block] * 
-                0.00787401574803149606 * 
-                absmax32_f32[:, i:i+1]
-            )
-    
-    # Apply scales to output blocks
-    for block_idx in range(blocks_per_row):
-        col_start = block_idx * 64
-        col_end = min(col_start + 64, n)
-        output[:, col_start:col_end] *= scale_expanded[:, block_idx:block_idx+1]
-    
+
+    # Vectorized double scale application across all columns
+    cols = torch.arange(n, device=device)
+    col_to_block = cols // 64
+    col_to_absmax32 = col_to_block // 4
+    scales = (
+        absmax_f32[:, col_to_block] * 0.00787401574803149606 * absmax32_f32[:, col_to_absmax32]
+    )
+    output *= scales
+
     # Convert to target dtype
     return output.to(dtype)
 

@@ -13,8 +13,15 @@ pip install -e .
 ```python
 from nf4_triton_dequantization import triton_dequantize_nf4
 
-# Works with any Linear4bit layer
+# Works with any bitsandbytes Linear4bit layer
 dequantized_weights = triton_dequantize_nf4(linear_4bit_layer)
+
+# Notes
+# - On Tesla T4 (compute 7.5) and older GPUs, the package
+#   automatically uses a fully vectorized PyTorch backend that
+#   avoids Triton JIT overhead and is optimized end-to-end.
+# - On Ampere+ GPUs you can force the Triton kernel with:
+#   export NF4_USE_TRITON=1
 ```
 
 ## Benchmarking
@@ -22,6 +29,12 @@ dequantized_weights = triton_dequantize_nf4(linear_4bit_layer)
 ```bash
 python benchmark.py
 ```
+
+The default benchmark compares:
+- Unsloth `fast_dequantize` (CUDA/C++)
+- PEFT dequantization
+- This package (auto-select backend). On T4, it uses the vectorized
+  PyTorch path by default.
 
 ## Requirements
 
