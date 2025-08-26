@@ -242,9 +242,28 @@ def fast_pytorch_dequantize(module):
     out3d = torch.stack((low3, high3), dim=-1).reshape(m, blocks_per_row, 64)
 
     # Build per-block scales via indexing (avoid repeat_interleave)
-    inv127 = torch.tensor(0.00787401574803149606, dtype=compute_dtype, device=device)
-    group_idx = torch.arange(blocks_per_row, device=device) // 4
-    scales3d = absmax_t.view(m, blocks_per_row, 1) * inv127 * absmax32_t[:, group_idx].view(m, blocks_per_row, 1)
+    # Cache per-module combined scales since quant_state is static after quantization
+    module_cache_ok = (
+        hasattr(module, "_nf4_scale_blocks") and
+        getattr(module, "_nf4_scale_blocks", None) is not None and
+        getattr(module, "_nf4_scale_blocks_shape", None) == (m, blocks_per_row) and
+        getattr(module, "_nf4_scale_blocks_dtype", None) == compute_dtype and
+        getattr(module, "_nf4_scale_blocks_device", None) == device
+    )
+
+    if not module_cache_ok:
+        group_idx = torch.arange(blocks_per_row, device=device) // 4
+        # Combined per-block scale = absmax * (1/127) * absmax32_group
+        scale_blocks = absmax_t * (compute_dtype(1.0) / compute_dtype(127.0)) * absmax32_t[:, group_idx]
+        # Persist on the module for reuse
+        module._nf4_scale_blocks = scale_blocks  # [m, blocks]
+        module._nf4_scale_blocks_shape = (m, blocks_per_row)
+        module._nf4_scale_blocks_dtype = compute_dtype
+        module._nf4_scale_blocks_device = device
+    else:
+        scale_blocks = module._nf4_scale_blocks
+
+    scales3d = scale_blocks.view(m, blocks_per_row, 1)
 
     out3d *= scales3d
     output = out3d.view(m, blocks_per_row * 64)[:, :n]
