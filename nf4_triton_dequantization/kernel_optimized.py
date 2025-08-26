@@ -156,20 +156,28 @@ def fast_pytorch_dequantize(module):
     m = module.out_features
     n = module.in_features
 
+    # Decide compute dtype for speed/precision tradeoff
+    # On CUDA/T4, computing in float16 is faster; we'll cast result to requested dtype.
+    if qweight.is_cuda:
+        compute_dtype = torch.float16 if dtype in (torch.float16, torch.bfloat16) else torch.float32
+    else:
+        compute_dtype = torch.float32
+
     # Pre-compute constants
     blocks_per_row = (n + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
 
     # NF4 lookup table on correct device (cached)
-    nf4_lut = _NF4_LUT_CACHE.get(device)
+    lut_key = (device, compute_dtype)
+    nf4_lut = _NF4_LUT_CACHE.get(lut_key)
     if nf4_lut is None:
         nf4_lut = torch.tensor([
             -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
             -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
             0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
             0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
-        ], dtype=torch.float32, device=device)
-        _NF4_LUT_CACHE[device] = nf4_lut
+        ], dtype=compute_dtype, device=device)
+        _NF4_LUT_CACHE[lut_key] = nf4_lut
 
     # Reshape scales efficiently - handle flattened or per-row tensors
     if absmax.dim() == 1:
@@ -200,9 +208,9 @@ def fast_pytorch_dequantize(module):
         elif absmax32.shape[1] == absmax32_per_row and absmax32.shape[0] == 1:
             absmax32 = absmax32.expand(m, -1)
 
-    # Convert to float32 for computation
-    absmax_f32 = absmax.to(torch.float32)
-    absmax32_f32 = absmax32.to(torch.float32)
+    # Convert scales to compute dtype
+    absmax_t = absmax.to(compute_dtype)
+    absmax32_t = absmax32.to(compute_dtype)
 
     # Vectorized extraction and lookup
     # Work with uint8 bytes to minimize conversions
@@ -219,27 +227,30 @@ def fast_pytorch_dequantize(module):
     low_values = nf4_lut[low_nibbles].view(m, -1)
     high_values = nf4_lut[high_nibbles].view(m, -1)
 
-    # Interleave values into a padded buffer to allow fast blockwise scaling
-    n_pad = blocks_per_row * 64
-    output = torch.empty((m, n_pad), dtype=torch.float32, device=device)
-    output[:, 0:n:2] = low_values
-    output[:, 1:n:2] = high_values
+    # Interleave by stacking to avoid strided assignments
+    # Pad to full blocks if n is not a multiple of 64
+    bytes_needed = blocks_per_row * 32
+    cur_bytes = low_values.shape[1]
+    if cur_bytes < bytes_needed:
+        pad = bytes_needed - cur_bytes
+        pad_zeros = torch.zeros((m, pad), dtype=compute_dtype, device=device)
+        low_values = torch.cat((low_values, pad_zeros), dim=1)
+        high_values = torch.cat((high_values, pad_zeros), dim=1)
 
-    # Build per-block scales and apply via broadcasting over [m, blocks, 64]
-    # absmax per block: [m, blocks, 1]
-    absmax_blocks = absmax_f32.view(m, -1, 1)
-    # absmax32 per group, expand to blocks: [m, blocks, 1]
-    absmax32_groups = absmax32_f32.view(m, -1, 1)
-    absmax32_expanded = absmax32_groups.repeat_interleave(4, dim=1)[:, :blocks_per_row, :]
-    scales3d = absmax_blocks * 0.00787401574803149606 * absmax32_expanded  # [m, blocks, 1]
+    low3 = low_values.view(m, blocks_per_row, 32)
+    high3 = high_values.view(m, blocks_per_row, 32)
+    out3d = torch.stack((low3, high3), dim=-1).reshape(m, blocks_per_row, 64)
 
-    out3d = output.view(m, blocks_per_row, 64)
+    # Build per-block scales via indexing (avoid repeat_interleave)
+    inv127 = torch.tensor(0.00787401574803149606, dtype=compute_dtype, device=device)
+    group_idx = torch.arange(blocks_per_row, device=device) // 4
+    scales3d = absmax_t.view(m, blocks_per_row, 1) * inv127 * absmax32_t[:, group_idx].view(m, blocks_per_row, 1)
+
     out3d *= scales3d
-    # Slice back to original n
-    output = output[:, :n]
+    output = out3d.view(m, blocks_per_row * 64)[:, :n]
 
-    # Convert to target dtype
-    return output.to(dtype)
+    # Convert to target dtype if needed
+    return output.to(dtype) if output.dtype != dtype else output
 
 
 def triton_dequantize_nf4(module):
