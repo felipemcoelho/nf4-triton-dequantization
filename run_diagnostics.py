@@ -142,7 +142,8 @@ try:
         print("\n4. TESTING PURE PYTORCH FALLBACK")
         print("-"*40)
         
-        from nf4_triton_dequantization.kernel import pure_torch_fallback
+        # Use the optimized pure torch fallback directly
+        from nf4_triton_dequantization.kernel_optimized import fast_pytorch_dequantize as pure_torch_fallback
         
         start = time.time()
         result_pytorch = pure_torch_fallback(weight)

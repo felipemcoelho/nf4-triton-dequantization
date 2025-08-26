@@ -23,26 +23,18 @@ This will:
 
 ## Using the Fallback
 
-If diagnostics show that Triton is slow on your system, you have three options:
+On Tesla T4 and older GPUs, the package automatically uses the optimized PyTorch fallback.
+On newer GPUs, you can force Triton to compare:
 
-### Option 1: Manual Fallback (Environment Variable)
 ```bash
-# Use PyTorch fallback instead of Triton
-export NF4_USE_PYTORCH_FALLBACK=1
+export NF4_USE_TRITON=1
 python benchmark.py
 ```
 
-### Option 2: Auto-Selection
-```bash
-# Automatically select best implementation
-export NF4_AUTO_SELECT=1
-python benchmark.py
-```
-
-### Option 3: Modify Code
+Or explicitly call the fallback in your code:
 ```python
 # In your code, explicitly use the fallback
-from nf4_triton_dequantization.kernel import pure_torch_fallback
+from nf4_triton_dequantization.kernel_optimized import fast_pytorch_dequantize as pure_torch_fallback
 result = pure_torch_fallback(module)
 ```
 
@@ -65,7 +57,10 @@ Recommended: Use pure_torch_fallback function
 
 ### Issue: Triton is 50x+ slower than expected
 **Cause**: Triton compilation overhead or compatibility issues
-**Solution**: Use `NF4_USE_PYTORCH_FALLBACK=1`
+**Solution**: Use the PyTorch fallback (default on T4). To ensure fallback:
+```bash
+export NF4_USE_TRITON=0
+```
 
 ### Issue: NaN values in output
 **Cause**: Numerical instability in kernel
@@ -99,18 +94,14 @@ Run the full benchmark suite:
 # Standard benchmark
 python benchmark.py
 
-# With fallback
-NF4_USE_PYTORCH_FALLBACK=1 python benchmark.py
-
-# With auto-selection
-NF4_AUTO_SELECT=1 python benchmark.py
+# Force Triton (on newer GPUs)
+NF4_USE_TRITON=1 python benchmark.py
 ```
 
 ## Environment Variables
 
-- `NF4_USE_PYTORCH_FALLBACK`: Set to 1 to use PyTorch implementation
-- `NF4_AUTO_SELECT`: Set to 1 to auto-select best implementation
-- `CUDA_VISIBLE_DEVICES`: Select GPU (e.g., `CUDA_VISIBLE_DEVICES=0`)
+- `NF4_USE_TRITON`: `1` to force Triton backend (Ampere+ recommended), `0` or unset to use PyTorch fallback.
+- `CUDA_VISIBLE_DEVICES`: Select GPU (e.g., `CUDA_VISIBLE_DEVICES=0`).
 
 ## GPU Compatibility
 

@@ -8,6 +8,9 @@ import triton
 import triton.language as tl
 import os
 
+# Simple device->LUT cache to avoid per-call allocation
+_NF4_LUT_CACHE = {}
+
 
 # Check if we should use Triton or fallback
 USE_TRITON = os.environ.get('NF4_USE_TRITON', '0').lower() in ('1', 'true', 'yes')
@@ -157,13 +160,16 @@ def fast_pytorch_dequantize(module):
     blocks_per_row = (n + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
 
-    # NF4 lookup table on correct device
-    nf4_lut = torch.tensor([
-        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
-    ], dtype=torch.float32, device=device)
+    # NF4 lookup table on correct device (cached)
+    nf4_lut = _NF4_LUT_CACHE.get(device)
+    if nf4_lut is None:
+        nf4_lut = torch.tensor([
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+            0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+        ], dtype=torch.float32, device=device)
+        _NF4_LUT_CACHE[device] = nf4_lut
 
     # Reshape scales efficiently - handle flattened or per-row tensors
     if absmax.dim() == 1:
@@ -174,6 +180,12 @@ def fast_pytorch_dequantize(module):
             absmax = absmax.unsqueeze(0).expand(m, -1)
         else:
             absmax = absmax.view(m, -1)
+    elif absmax.dim() == 2 and absmax.shape != (m, blocks_per_row):
+        # Try best-effort reshape/expand
+        if absmax.numel() == m * blocks_per_row:
+            absmax = absmax.view(m, blocks_per_row)
+        elif absmax.shape[1] == blocks_per_row and absmax.shape[0] == 1:
+            absmax = absmax.expand(m, -1)
     if absmax32.dim() == 1:
         total_absmax32 = m * absmax32_per_row
         if absmax32.numel() == total_absmax32:
@@ -182,6 +194,11 @@ def fast_pytorch_dequantize(module):
             absmax32 = absmax32.unsqueeze(0).expand(m, -1)
         else:
             absmax32 = absmax32.view(m, -1)
+    elif absmax32.dim() == 2 and absmax32.shape != (m, absmax32_per_row):
+        if absmax32.numel() == m * absmax32_per_row:
+            absmax32 = absmax32.view(m, absmax32_per_row)
+        elif absmax32.shape[1] == absmax32_per_row and absmax32.shape[0] == 1:
+            absmax32 = absmax32.expand(m, -1)
 
     # Convert to float32 for computation
     absmax_f32 = absmax.to(torch.float32)
@@ -194,25 +211,32 @@ def fast_pytorch_dequantize(module):
     else:
         qbytes = qweight.to(torch.uint8)
 
-    low_nibbles = (qbytes & 0xF).to(torch.long)
-    high_nibbles = ((qbytes >> 4) & 0xF).to(torch.long)
+    # Flattened lookup to reduce advanced indexing overhead
+    qbytes_flat = qbytes.view(-1)
+    low_nibbles = (qbytes_flat & 0xF).to(torch.long)
+    high_nibbles = ((qbytes_flat >> 4) & 0xF).to(torch.long)
 
-    low_values = nf4_lut[low_nibbles]
-    high_values = nf4_lut[high_nibbles]
+    low_values = nf4_lut[low_nibbles].view(m, -1)
+    high_values = nf4_lut[high_nibbles].view(m, -1)
 
-    # Pre-allocate output in float32, then cast to target dtype
-    output = torch.empty((m, n), dtype=torch.float32, device=device)
-    output[:, 0::2] = low_values
-    output[:, 1::2] = high_values
+    # Interleave values into a padded buffer to allow fast blockwise scaling
+    n_pad = blocks_per_row * 64
+    output = torch.empty((m, n_pad), dtype=torch.float32, device=device)
+    output[:, 0:n:2] = low_values
+    output[:, 1:n:2] = high_values
 
-    # Vectorized double scale application across all columns
-    cols = torch.arange(n, device=device)
-    col_to_block = cols // 64
-    col_to_absmax32 = col_to_block // 4
-    scales = (
-        absmax_f32[:, col_to_block] * 0.00787401574803149606 * absmax32_f32[:, col_to_absmax32]
-    )
-    output *= scales
+    # Build per-block scales and apply via broadcasting over [m, blocks, 64]
+    # absmax per block: [m, blocks, 1]
+    absmax_blocks = absmax_f32.view(m, -1, 1)
+    # absmax32 per group, expand to blocks: [m, blocks, 1]
+    absmax32_groups = absmax32_f32.view(m, -1, 1)
+    absmax32_expanded = absmax32_groups.repeat_interleave(4, dim=1)[:, :blocks_per_row, :]
+    scales3d = absmax_blocks * 0.00787401574803149606 * absmax32_expanded  # [m, blocks, 1]
+
+    out3d = output.view(m, blocks_per_row, 64)
+    out3d *= scales3d
+    # Slice back to original n
+    output = output[:, :n]
 
     # Convert to target dtype
     return output.to(dtype)
@@ -308,4 +332,7 @@ def triton_dequantize_nf4(module):
 
 def reset_triton_dequantize_state():
     """Reset any cached state."""
-    pass
+    _NF4_LUT_CACHE.clear()
+
+# Provide a friendly alias for diagnostics and users
+pure_torch_fallback = fast_pytorch_dequantize
