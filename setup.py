@@ -15,10 +15,15 @@ setup(
         "unsloth",
         "peft",
         "transformers",
+        "numpy",
+        "matplotlib",
+        "tabulate",
     ],
     extras_require={
         "benchmark": [
             "matplotlib",
+            "numpy",
+            "tabulate",
         ],
     },
     classifiers=[
