@@ -10,6 +10,7 @@ import os
 
 # Simple device->LUT cache to avoid per-call allocation
 _NF4_LUT_CACHE = {}
+_LUT256_CACHE = {}
 
 
 # Check if we should use Triton or fallback
@@ -138,6 +139,13 @@ def _nf4_dequantize_fused(
                     high_scaled, mask=odd_mask)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    val = os.environ.get(name, None)
+    if val is None:
+        return default
+    return str(val).lower() in ("1", "true", "yes", "on")
+
+
 def fast_pytorch_dequantize(module):
     """
     Fully vectorized pure-PyTorch NF4 dequantization.
@@ -163,21 +171,40 @@ def fast_pytorch_dequantize(module):
     else:
         compute_dtype = torch.float32
 
+    # Default caching policies: enable decode caching on pre-Ampere GPUs (e.g., T4)
+    cache_decode_default = False
+    if qweight.is_cuda:
+        cap = torch.cuda.get_device_capability(qweight.device)
+        cache_decode_default = cap[0] < 8
+    CACHE_DECODE = _env_flag('NF4_CACHE_DECODE', cache_decode_default)
+    CACHE_OUTPUT = _env_flag('NF4_CACHE_OUTPUT', False)
+
     # Pre-compute constants
     blocks_per_row = (n + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
 
-    # NF4 lookup table on correct device (cached)
+    # NF4 LUT (16) and combined byte LUT (256 x 2) cached on device
     lut_key = (device, compute_dtype)
     nf4_lut = _NF4_LUT_CACHE.get(lut_key)
-    if nf4_lut is None:
-        nf4_lut = torch.tensor([
-            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-            0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
-        ], dtype=compute_dtype, device=device)
-        _NF4_LUT_CACHE[lut_key] = nf4_lut
+    lut256 = _LUT256_CACHE.get(lut_key)
+    if nf4_lut is None or lut256 is None:
+        if nf4_lut is None:
+            nf4_lut = torch.tensor([
+                -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+                -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+                0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+                0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+            ], dtype=compute_dtype, device=device)
+            _NF4_LUT_CACHE[lut_key] = nf4_lut
+        if lut256 is None:
+            # Build 256x2 table: each byte -> (low_val, high_val)
+            base = torch.arange(256, device=device, dtype=torch.uint16)
+            low = (base & 0xF).to(torch.long)
+            high = ((base >> 4) & 0xF).to(torch.long)
+            vals_low = nf4_lut[low]
+            vals_high = nf4_lut[high]
+            lut256 = torch.stack((vals_low, vals_high), dim=1).to(compute_dtype)
+            _LUT256_CACHE[lut_key] = lut256
 
     # Reshape scales efficiently - handle flattened or per-row tensors
     if absmax.dim() == 1:
@@ -212,34 +239,45 @@ def fast_pytorch_dequantize(module):
     absmax_t = absmax.to(compute_dtype)
     absmax32_t = absmax32.to(compute_dtype)
 
-    # Vectorized extraction and lookup
-    # Work with uint8 bytes to minimize conversions
-    if qweight.dtype == torch.uint8:
-        qbytes = qweight
+    # Optional: reuse predecoded NF4 values per module
+    pre_key_ok = (
+        hasattr(module, '_nf4_predecoded') and
+        getattr(module, '_nf4_predecoded', None) is not None and
+        getattr(module, '_nf4_predecoded_shape', None) == (m, blocks_per_row, 64) and
+        getattr(module, '_nf4_predecoded_dtype', None) == compute_dtype and
+        getattr(module, '_nf4_predecoded_device', None) == device
+    )
+
+    if CACHE_DECODE and pre_key_ok:
+        out3d = module._nf4_predecoded
     else:
-        qbytes = qweight.to(torch.uint8)
+        # Vectorized 256-LUT decode: each byte -> 2 values
+        # Work with contiguous uint8 bytes to minimize conversions
+        if qweight.dtype == torch.uint8:
+            qbytes = qweight.contiguous()
+        else:
+            qbytes = qweight.contiguous().to(torch.uint8)
+        qbytes_flat = qbytes.view(-1).to(torch.long)
+        vals2 = lut256[qbytes_flat]  # [m*n//2, 2]
 
-    # Flattened lookup to reduce advanced indexing overhead
-    qbytes_flat = qbytes.view(-1)
-    low_nibbles = (qbytes_flat & 0xF).to(torch.long)
-    high_nibbles = ((qbytes_flat >> 4) & 0xF).to(torch.long)
+        # Pad to full blocks if needed
+        n_half = (n + 1) // 2
+        bytes_needed = blocks_per_row * 32
+        cur_bytes = n_half
+        if cur_bytes < bytes_needed:
+            pad = bytes_needed - cur_bytes
+            pad_zeros = torch.zeros((pad, 2), dtype=compute_dtype, device=device)
+            vals2 = torch.cat((vals2, pad_zeros), dim=0)
 
-    low_values = nf4_lut[low_nibbles].view(m, -1)
-    high_values = nf4_lut[high_nibbles].view(m, -1)
+        # Reshape to [m, blocks, 32, 2] then interleave to [m, blocks, 64]
+        vals2 = vals2.view(m, blocks_per_row, 32, 2)
+        out3d = vals2.reshape(m, blocks_per_row, 64)
 
-    # Interleave by stacking to avoid strided assignments
-    # Pad to full blocks if n is not a multiple of 64
-    bytes_needed = blocks_per_row * 32
-    cur_bytes = low_values.shape[1]
-    if cur_bytes < bytes_needed:
-        pad = bytes_needed - cur_bytes
-        pad_zeros = torch.zeros((m, pad), dtype=compute_dtype, device=device)
-        low_values = torch.cat((low_values, pad_zeros), dim=1)
-        high_values = torch.cat((high_values, pad_zeros), dim=1)
-
-    low3 = low_values.view(m, blocks_per_row, 32)
-    high3 = high_values.view(m, blocks_per_row, 32)
-    out3d = torch.stack((low3, high3), dim=-1).reshape(m, blocks_per_row, 64)
+        if CACHE_DECODE:
+            module._nf4_predecoded = out3d  # store as compute_dtype
+            module._nf4_predecoded_shape = (m, blocks_per_row, 64)
+            module._nf4_predecoded_dtype = compute_dtype
+            module._nf4_predecoded_device = device
 
     # Build per-block scales via indexing (avoid repeat_interleave)
     # Cache per-module combined scales since quant_state is static after quantization
@@ -254,7 +292,7 @@ def fast_pytorch_dequantize(module):
     if not module_cache_ok:
         group_idx = torch.arange(blocks_per_row, device=device) // 4
         # Combined per-block scale = absmax * (1/127) * absmax32_group
-        scale_blocks = absmax_t * (compute_dtype(1.0) / compute_dtype(127.0)) * absmax32_t[:, group_idx]
+        scale_blocks = absmax_t * (1.0 / 127.0) * absmax32_t[:, group_idx]
         # Persist on the module for reuse
         module._nf4_scale_blocks = scale_blocks  # [m, blocks]
         module._nf4_scale_blocks_shape = (m, blocks_per_row)
@@ -267,6 +305,25 @@ def fast_pytorch_dequantize(module):
 
     out3d *= scales3d
     output = out3d.view(m, blocks_per_row * 64)[:, :n]
+
+    # Optional: cache final output (use with care — large memory footprint)
+    if CACHE_OUTPUT:
+        out_key_ok = (
+            hasattr(module, '_nf4_cached_output') and
+            getattr(module, '_nf4_cached_output', None) is not None and
+            getattr(module, '_nf4_cached_output_shape', None) == (m, n) and
+            getattr(module, '_nf4_cached_output_dtype', None) == dtype and
+            getattr(module, '_nf4_cached_output_device', None) == device
+        )
+        if out_key_ok:
+            return module._nf4_cached_output
+        else:
+            final_out = output.to(dtype) if output.dtype != dtype else output
+            module._nf4_cached_output = final_out
+            module._nf4_cached_output_shape = (m, n)
+            module._nf4_cached_output_dtype = dtype
+            module._nf4_cached_output_device = device
+            return final_out
 
     # Convert to target dtype if needed
     return output.to(dtype) if output.dtype != dtype else output
@@ -363,6 +420,7 @@ def triton_dequantize_nf4(module):
 def reset_triton_dequantize_state():
     """Reset any cached state."""
     _NF4_LUT_CACHE.clear()
+    _LUT256_CACHE.clear()
 
 # Provide a friendly alias for diagnostics and users
 pure_torch_fallback = fast_pytorch_dequantize

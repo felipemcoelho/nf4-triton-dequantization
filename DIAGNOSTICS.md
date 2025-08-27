@@ -101,6 +101,8 @@ NF4_USE_TRITON=1 python benchmark.py
 ## Environment Variables
 
 - `NF4_USE_TRITON`: `1` to force Triton backend (Ampere+ recommended), `0` or unset to use PyTorch fallback.
+- `NF4_CACHE_DECODE`: `1` to cache byte→NF4 decode per module (default auto-on for T4).
+- `NF4_CACHE_OUTPUT`: `1` to cache full dequantized output per module (max speed, high memory).
 - `CUDA_VISIBLE_DEVICES`: Select GPU (e.g., `CUDA_VISIBLE_DEVICES=0`).
 
 ## GPU Compatibility
