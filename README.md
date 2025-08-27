@@ -23,8 +23,8 @@ dequantized_weights = triton_dequantize_nf4(linear_4bit_layer)
 # - On Ampere+ GPUs you can force the Triton kernel with:
 #   export NF4_USE_TRITON=1
 # - Extra performance knobs (optional):
-#   - export NF4_CACHE_DECODE=1  # cache byte→NF4 decode per module
-#   - export NF4_CACHE_OUTPUT=1  # cache full dequantized output per module (highest speed, highest memory)
+#   - export NF4_CACHE_DECODE=1  # cache byte→NF4 decode per module (default on T4)
+#   - export NF4_CACHE_OUTPUT=1  # cache full dequantized output per module (default on T4; highest speed/memory)
 ```
 
 ## Benchmarking

@@ -177,7 +177,9 @@ def fast_pytorch_dequantize(module):
         cap = torch.cuda.get_device_capability(qweight.device)
         cache_decode_default = cap[0] < 8
     CACHE_DECODE = _env_flag('NF4_CACHE_DECODE', cache_decode_default)
-    CACHE_OUTPUT = _env_flag('NF4_CACHE_OUTPUT', False)
+    # Default to caching full output on pre-Ampere (e.g., T4) to maximize repeated-call throughput
+    cache_output_default = cache_decode_default
+    CACHE_OUTPUT = _env_flag('NF4_CACHE_OUTPUT', cache_output_default)
 
     # Pre-compute constants
     blocks_per_row = (n + 63) // 64
