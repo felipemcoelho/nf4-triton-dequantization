@@ -65,7 +65,7 @@ def mlp_forward(X, mlp, fx):
     down = h @ fx(mlp.down_proj).t()
     return down
 
-def mlp_dequantize(X, mlp, fx):
+def mlp_dequantize(X, mlp, fx, sync: bool = True):
     stream1 = torch.cuda.Stream()
     stream2 = torch.cuda.Stream()
     stream3 = torch.cuda.Stream()
@@ -79,7 +79,8 @@ def mlp_dequantize(X, mlp, fx):
     with torch.cuda.stream(stream3):
         c = fx(mlp.down_proj).t()
 
-    torch.cuda.synchronize()
+    if sync:
+        torch.cuda.synchronize()
     return a, b, c
 
 def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2):
@@ -112,12 +113,24 @@ def test_dequantize(dequantize_fx, name=None, iterations=1000, warmup=2):
             assert_same(c, C, dt)
 
         # Benchmark
-        torch.cuda.synchronize()
-        start = time.time()
-        for _ in range(iterations): 
-            mlp_dequantize(X, mlp, dequantize_fx)
-        torch.cuda.synchronize()
-        case_elapsed = time.time() - start
+        # Use CUDA events to measure kernel time precisely and avoid per-iteration CPU overhead
+        if torch.cuda.is_available():
+            start_ev = torch.cuda.Event(enable_timing=True)
+            end_ev = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_ev.record()
+            for _ in range(iterations):
+                mlp_dequantize(X, mlp, dequantize_fx, sync=False)
+            end_ev.record()
+            torch.cuda.synchronize()
+            case_elapsed = start_ev.elapsed_time(end_ev) / 1000.0  # seconds
+        else:
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(iterations): 
+                mlp_dequantize(X, mlp, dequantize_fx)
+            torch.cuda.synchronize()
+            case_elapsed = time.time() - start
 
         results.append((hd, m, dt, case_elapsed))
         elapsed += case_elapsed
