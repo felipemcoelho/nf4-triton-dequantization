@@ -278,10 +278,35 @@ def _nf4_dequantize_pairs_loop(
         offsets = tl.arange(0, 32)
         tl.multiple_of(offsets, 16)
         packed = tl.load(qweight_ptr + q_base + offsets, cache_modifier=".ca")
-        low_vals = tl.load(lut_low_ptr + packed, cache_modifier=".ca")
-        high_vals = tl.load(lut_high_ptr + packed, cache_modifier=".ca")
+        low = packed & 0xF
+        high = (packed >> 4) & 0xF
 
-        scale_t = scale.to(low_vals.dtype)
+        # Map nibbles to NF4 values using branchless select chain (no LUT loads)
+        # Constants are compile-time and will be kept in registers/const memory
+        def map_nf4(x):
+            x = x.to(tl.int32)
+            neg = tl.where(x == 0, -1.0,
+                  tl.where(x == 1, -0.6961928009986877,
+                  tl.where(x == 2, -0.5250730514526367,
+                  tl.where(x == 3, -0.39491748809814453,
+                  tl.where(x == 4, -0.28444138169288635,
+                  tl.where(x == 5, -0.18477343022823334,
+                  tl.where(x == 6, -0.09105003625154495, 0.0)))))))
+            pos = tl.where(x == 8, 0.07958029955625534,
+                  tl.where(x == 9, 0.16093020141124725,
+                  tl.where(x == 10, 0.24611230194568634,
+                  tl.where(x == 11, 0.33791524171829224,
+                  tl.where(x == 12, 0.44070982933044434,
+                  tl.where(x == 13, 0.5626170039176941,
+                  tl.where(x == 14, 0.7229568362236023, 1.0)))))))
+            return tl.where(x < 8, neg, pos)
+
+        compute_t = tl.float16
+        low_vals = map_nf4(low).to(compute_t)
+        high_vals = map_nf4(high).to(compute_t)
+
+        scale_t = scale.to(compute_t)
+        # Scale in half for throughput, then cast at store
         low_scaled = low_vals * scale_t
         high_scaled = high_vals * scale_t
 
@@ -290,8 +315,10 @@ def _nf4_dequantize_pairs_loop(
         even_mask = (col_start + even_offs) < n
         odd_mask = (col_start + odd_offs) < n
 
-        tl.store(output_ptr + o_base + even_offs, low_scaled, mask=even_mask, eviction_policy="evict_first")
-        tl.store(output_ptr + o_base + odd_offs, high_scaled, mask=odd_mask, eviction_policy="evict_first")
+        # Cast to output dtype prior to store for bandwidth
+        dout = tl.dtype_of(output_ptr)
+        tl.store(output_ptr + o_base + even_offs, low_scaled.to(dout), mask=even_mask, eviction_policy="evict_first")
+        tl.store(output_ptr + o_base + odd_offs,  high_scaled.to(dout), mask=odd_mask, eviction_policy="evict_first")
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -578,7 +605,7 @@ def triton_dequantize_nf4(module):
         stages = 2
 
         # Hardcoded kernel defaults optimized for T4 (no env required)
-        blocks_per_pid = 16
+        blocks_per_pid = 12
         warps = max(1, warps)
         stages = max(1, stages)
         total_blocks = m * blocks_per_row
@@ -594,7 +621,7 @@ def triton_dequantize_nf4(module):
             blocks_per_row,
             absmax32_per_row,
             blocks_per_pid,
-            num_warps=8,
+            num_warps=4,
             num_stages=2,
         )
 
