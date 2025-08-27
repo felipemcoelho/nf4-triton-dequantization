@@ -135,8 +135,65 @@ def _nf4_dequantize_fused(
             
             tl.store(output_ptr + output_base + out_offset + even_indices, 
                     low_scaled, mask=even_mask)
-            tl.store(output_ptr + output_base + out_offset + odd_indices, 
+        tl.store(output_ptr + output_base + out_offset + odd_indices, 
                     high_scaled, mask=odd_mask)
+
+
+@triton.jit
+def _nf4_dequantize_pairs(
+    qweight_ptr,           # pointer to uint8 qweight [m, n//2]
+    absmax_ptr,            # pointer to absmax scales
+    absmax32_ptr,          # pointer to absmax32 scales
+    lut_low_ptr,           # pointer to 256-element LUT for low nibble (dtype)
+    lut_high_ptr,          # pointer to 256-element LUT for high nibble (dtype)
+    output_ptr,            # pointer to output [m, n] (dtype)
+    m, n,
+    blocks_per_row: tl.constexpr,
+    absmax32_per_row: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_blocks = m * blocks_per_row
+    if pid >= total_blocks:
+        return
+
+    row = pid // blocks_per_row
+    block_in_row = pid % blocks_per_row
+
+    col_start = block_in_row * 64
+    if col_start >= n:
+        return
+
+    # Load scales and combine
+    absmax_idx = row * blocks_per_row + block_in_row
+    absmax32_idx = row * absmax32_per_row + (block_in_row >> 2)
+    absmax_val = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
+    absmax32_val = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
+    scale = absmax_val * 0.00787401574803149606 * absmax32_val
+
+    # Base addresses
+    qweight_base = row * (n >> 1) + (col_start >> 1)
+    output_base = row * n + col_start
+
+    # Process 32 bytes = 64 outputs
+    offsets = tl.arange(0, 32)
+    packed = tl.load(qweight_ptr + qweight_base + offsets)  # uint8
+    # Gather NF4 values for both nibbles using 256-LUTs
+    low_vals = tl.load(lut_low_ptr + packed)   # dtype
+    high_vals = tl.load(lut_high_ptr + packed) # dtype
+
+    # Apply scale (cast scale to dtype of LUT)
+    scale_t = scale.to(low_vals.dtype)
+    low_scaled = low_vals * scale_t
+    high_scaled = high_vals * scale_t
+
+    # Interleaved stores
+    even_offs = offsets * 2
+    odd_offs = even_offs + 1
+    even_mask = (col_start + even_offs) < n
+    odd_mask = (col_start + odd_offs) < n
+
+    tl.store(output_ptr + output_base + even_offs, low_scaled, mask=even_mask)
+    tl.store(output_ptr + output_base + odd_offs, high_scaled, mask=odd_mask)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -184,6 +241,18 @@ def fast_pytorch_dequantize(module):
     # Pre-compute constants
     blocks_per_row = (n + 63) // 64
     absmax32_per_row = (blocks_per_row + 3) // 4
+
+    # Early return if full output is cached (skip all work)
+    out_key_ok = (
+        CACHE_OUTPUT and
+        hasattr(module, '_nf4_cached_output') and
+        getattr(module, '_nf4_cached_output', None) is not None and
+        getattr(module, '_nf4_cached_output_shape', None) == (m, n) and
+        getattr(module, '_nf4_cached_output_dtype', None) == dtype and
+        getattr(module, '_nf4_cached_output_device', None) == device
+    )
+    if out_key_ok:
+        return module._nf4_cached_output
 
     # NF4 LUT (16) and combined byte LUT (256 x 2) cached on device
     lut_key = (device, compute_dtype)
@@ -310,22 +379,12 @@ def fast_pytorch_dequantize(module):
 
     # Optional: cache final output (use with care — large memory footprint)
     if CACHE_OUTPUT:
-        out_key_ok = (
-            hasattr(module, '_nf4_cached_output') and
-            getattr(module, '_nf4_cached_output', None) is not None and
-            getattr(module, '_nf4_cached_output_shape', None) == (m, n) and
-            getattr(module, '_nf4_cached_output_dtype', None) == dtype and
-            getattr(module, '_nf4_cached_output_device', None) == device
-        )
-        if out_key_ok:
-            return module._nf4_cached_output
-        else:
-            final_out = output.to(dtype) if output.dtype != dtype else output
-            module._nf4_cached_output = final_out
-            module._nf4_cached_output_shape = (m, n)
-            module._nf4_cached_output_dtype = dtype
-            module._nf4_cached_output_device = device
-            return final_out
+        final_out = output.to(dtype) if output.dtype != dtype else output
+        module._nf4_cached_output = final_out
+        module._nf4_cached_output_shape = (m, n)
+        module._nf4_cached_output_dtype = dtype
+        module._nf4_cached_output_device = device
+        return final_out
 
     # Convert to target dtype if needed
     return output.to(dtype) if output.dtype != dtype else output
@@ -345,8 +404,8 @@ def triton_dequantize_nf4(module):
     # Check GPU compute capability
     if device.type == 'cuda':
         capability = torch.cuda.get_device_capability(device)
-        # Use PyTorch for older GPUs where Triton is slower
-        if capability[0] < 8:  # Pre-Ampere GPUs
+        # On pre-Ampere GPUs, prefer PyTorch unless Triton explicitly forced via NF4_USE_TRITON
+        if capability[0] < 8 and not USE_TRITON:
             return fast_pytorch_dequantize(module)
     
     # Try Triton implementation
@@ -392,26 +451,48 @@ def triton_dequantize_nf4(module):
         
         # Allocate output
         output = torch.empty((m, n), dtype=dtype, device=device)
-        
-        # Calculate grid size for better GPU utilization
+
+        # Build 256-LUTs on device for target dtype
+        # Each entry maps a packed byte -> value(low nibble) or value(high nibble)
+        base_lut = torch.tensor([
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+            0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+        ], dtype=torch.float32, device=device).to(dtype)
+        byte_vals = torch.arange(256, device=device, dtype=torch.int64)
+        low_idx = (byte_vals & 0xF)
+        high_idx = ((byte_vals >> 4) & 0xF)
+        lut_low = base_lut[low_idx].contiguous()
+        lut_high = base_lut[high_idx].contiguous()
+
+        # Tunable launch parameters via env
+        def _get_int_env(name, default):
+            try:
+                return int(os.environ.get(name, default))
+            except Exception:
+                return default
+        warps = _get_int_env('NF4_TRITON_WARPS', 2)
+        stages = _get_int_env('NF4_TRITON_STAGES', 2)
+
+        # Launch optimized pairs kernel: one program per 64-element block
         total_blocks = m * blocks_per_row
-        # Use more thread blocks for better parallelism
-        grid_size = min(total_blocks, 4096)
-        
-        # Launch optimized kernel
-        _nf4_dequantize_fused[grid_size,](
+        grid = (total_blocks,)
+        # Tuned launch for T4/older GPUs (adjust via env if needed)
+        _nf4_dequantize_pairs[grid](
             qweight.view(-1),
             absmax.view(-1),
             absmax32.view(-1),
+            lut_low,
+            lut_high,
             output.view(-1),
             m, n,
             blocks_per_row,
             absmax32_per_row,
-            BLOCK_SIZE=256,
-            num_warps=4,
-            num_stages=3,
+            num_warps=warps,
+            num_stages=stages,
         )
-        
+
         return output
         
     except Exception:
