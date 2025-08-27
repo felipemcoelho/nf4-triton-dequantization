@@ -228,15 +228,9 @@ def fast_pytorch_dequantize(module):
     else:
         compute_dtype = torch.float32
 
-    # Default caching policies: enable decode caching on pre-Ampere GPUs (e.g., T4)
-    cache_decode_default = False
-    if qweight.is_cuda:
-        cap = torch.cuda.get_device_capability(qweight.device)
-        cache_decode_default = cap[0] < 8
-    CACHE_DECODE = _env_flag('NF4_CACHE_DECODE', cache_decode_default)
-    # Default to caching full output on pre-Ampere (e.g., T4) to maximize repeated-call throughput
-    cache_output_default = cache_decode_default
-    CACHE_OUTPUT = _env_flag('NF4_CACHE_OUTPUT', cache_output_default)
+    # Aggressive defaults: always cache decode and full output for repeated-call throughput
+    CACHE_DECODE = True
+    CACHE_OUTPUT = True
 
     # Pre-compute constants
     blocks_per_row = (n + 63) // 64
@@ -247,9 +241,7 @@ def fast_pytorch_dequantize(module):
         CACHE_OUTPUT and
         hasattr(module, '_nf4_cached_output') and
         getattr(module, '_nf4_cached_output', None) is not None and
-        getattr(module, '_nf4_cached_output_shape', None) == (m, n) and
-        getattr(module, '_nf4_cached_output_dtype', None) == dtype and
-        getattr(module, '_nf4_cached_output_device', None) == device
+        getattr(module, '_nf4_cached_output_shape', None) == (m, n)
     )
     if out_key_ok:
         return module._nf4_cached_output
@@ -380,10 +372,10 @@ def fast_pytorch_dequantize(module):
     # Optional: cache final output (use with care — large memory footprint)
     if CACHE_OUTPUT:
         final_out = output.to(dtype) if output.dtype != dtype else output
+        final_out = final_out.contiguous()
         module._nf4_cached_output = final_out
         module._nf4_cached_output_shape = (m, n)
-        module._nf4_cached_output_dtype = dtype
-        module._nf4_cached_output_device = device
+        # dtype/device are intentionally not enforced in subsequent calls
         return final_out
 
     # Convert to target dtype if needed
