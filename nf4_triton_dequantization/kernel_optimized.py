@@ -276,6 +276,7 @@ def _nf4_dequantize_pairs_loop(
         o_base = row_o_base + col_start
 
         offsets = tl.arange(0, 32)
+        tl.multiple_of(offsets, 16)
         packed = tl.load(qweight_ptr + q_base + offsets, cache_modifier=".ca")
         low_vals = tl.load(lut_low_ptr + packed, cache_modifier=".ca")
         high_vals = tl.load(lut_high_ptr + packed, cache_modifier=".ca")
@@ -573,53 +574,29 @@ def triton_dequantize_nf4(module):
                 return int(os.environ.get(name, default))
             except Exception:
                 return default
-        warps = _get_int_env('NF4_TRITON_WARPS', 4)
-        stages = _get_int_env('NF4_TRITON_STAGES', 3)
+        warps = 8
+        stages = 2
 
-        # Select kernel variant via env
-        def _get_int_env(name, default):
-            try:
-                return int(os.environ.get(name, default))
-            except Exception:
-                return default
-
-        kernel_kind = os.environ.get('NF4_TRITON_KERNEL', 'pairs_loop')
-        if kernel_kind == 'grouped':
-            group_blocks = _get_int_env('NF4_GROUP_BLOCKS', 8)
-            group_blocks = max(1, min(group_blocks, blocks_per_row))
-            grid = (m, (blocks_per_row + group_blocks - 1) // group_blocks)
-            _nf4_dequantize_grouped[grid](
-                qweight.view(-1),
-                absmax.view(-1),
-                absmax32.view(-1),
-                lut_low,
-                lut_high,
-                output.view(-1),
-                m, n,
-                blocks_per_row,
-                absmax32_per_row,
-                group_blocks,
-                num_warps=warps,
-                num_stages=stages,
-            )
-        else:
-            blocks_per_pid = _get_int_env('NF4_BLOCKS_PER_PID', 8)
-            total_blocks = m * blocks_per_row
-            grid = ((total_blocks + blocks_per_pid - 1) // blocks_per_pid,)
-            _nf4_dequantize_pairs_loop[grid](
-                qweight.view(-1),
-                absmax.view(-1),
-                absmax32.view(-1),
-                lut_low,
-                lut_high,
-                output.view(-1),
-                m, n,
-                blocks_per_row,
-                absmax32_per_row,
-                blocks_per_pid,
-                num_warps=warps,
-                num_stages=stages,
-            )
+        # Hardcoded kernel defaults optimized for T4 (no env required)
+        blocks_per_pid = 16
+        warps = max(1, warps)
+        stages = max(1, stages)
+        total_blocks = m * blocks_per_row
+        grid = ((total_blocks + blocks_per_pid - 1) // blocks_per_pid,)
+        _nf4_dequantize_pairs_loop[grid](
+            qweight.view(-1),
+            absmax.view(-1),
+            absmax32.view(-1),
+            lut_low,
+            lut_high,
+            output.view(-1),
+            m, n,
+            blocks_per_row,
+            absmax32_per_row,
+            blocks_per_pid,
+            num_warps=8,
+            num_stages=2,
+        )
 
         return output
         
