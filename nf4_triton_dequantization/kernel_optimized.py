@@ -219,6 +219,80 @@ def _nf4_dequantize_grouped(
         )
 
 
+@triton.jit
+def _nf4_dequantize_pairs_loop(
+    qweight_ptr,           # pointer to uint8 qweight [m, n//2]
+    absmax_ptr,            # pointer to absmax scales
+    absmax32_ptr,          # pointer to absmax32 scales
+    lut_low_ptr,           # pointer to 256-element LUT for low nibble (dtype)
+    lut_high_ptr,          # pointer to 256-element LUT for high nibble (dtype)
+    output_ptr,            # pointer to output [m, n] (dtype)
+    m, n,
+    blocks_per_row: tl.constexpr,
+    absmax32_per_row: tl.constexpr,
+    BLOCKS_PER_PID: tl.constexpr,
+):
+    # 1D grid across all 64-wide blocks; each program processes BLOCKS_PER_PID blocks
+    pid = tl.program_id(0)
+    total_blocks = m * blocks_per_row
+    start_block = pid * BLOCKS_PER_PID
+    if start_block >= total_blocks:
+        return
+
+    end_block = tl.minimum(start_block + BLOCKS_PER_PID, total_blocks)
+
+    # Iterate assigned blocks
+    # Hoist absmax32 loads: reuse within groups-of-4 when possible
+    prev_row = tl.full((), -1, tl.int32)
+    prev_grp4 = tl.full((), -1, tl.int32)
+    cached_a32 = tl.full((), 0.0, tl.float32)
+
+    for b in tl.static_range(BLOCKS_PER_PID):
+        blk = start_block + b
+        if blk >= end_block:
+            break
+
+        row = blk // blocks_per_row
+        block_in_row = blk % blocks_per_row
+        col_start = block_in_row * 64
+
+        # Load scales and combine
+        absmax_idx = row * blocks_per_row + block_in_row
+        a8 = tl.load(absmax_ptr + absmax_idx, cache_modifier=".ca")
+
+        grp4 = block_in_row >> 2
+        # If row or grp4 changed, reload absmax32
+        if (row != prev_row) | (grp4 != prev_grp4):
+            absmax32_idx = row * absmax32_per_row + grp4
+            cached_a32 = tl.load(absmax32_ptr + absmax32_idx, cache_modifier=".ca").to(tl.float32)
+            prev_row = row
+            prev_grp4 = grp4
+        scale = a8.to(tl.float32) * 0.00787401574803149606 * cached_a32
+
+        # Base addresses
+        row_q_base = row * (n >> 1)
+        row_o_base = row * n
+        q_base = row_q_base + (col_start >> 1)
+        o_base = row_o_base + col_start
+
+        offsets = tl.arange(0, 32)
+        packed = tl.load(qweight_ptr + q_base + offsets, cache_modifier=".ca")
+        low_vals = tl.load(lut_low_ptr + packed, cache_modifier=".ca")
+        high_vals = tl.load(lut_high_ptr + packed, cache_modifier=".ca")
+
+        scale_t = scale.to(low_vals.dtype)
+        low_scaled = low_vals * scale_t
+        high_scaled = high_vals * scale_t
+
+        even_offs = offsets * 2
+        odd_offs = even_offs + 1
+        even_mask = (col_start + even_offs) < n
+        odd_mask = (col_start + odd_offs) < n
+
+        tl.store(output_ptr + o_base + even_offs, low_scaled, mask=even_mask, eviction_policy="evict_first")
+        tl.store(output_ptr + o_base + odd_offs, high_scaled, mask=odd_mask, eviction_policy="evict_first")
+
+
 def _env_flag(name: str, default: bool) -> bool:
     val = os.environ.get(name, None)
     if val is None:
@@ -502,31 +576,50 @@ def triton_dequantize_nf4(module):
         warps = _get_int_env('NF4_TRITON_WARPS', 4)
         stages = _get_int_env('NF4_TRITON_STAGES', 3)
 
-        # Launch optimized grouped kernel: 2D grid, grouping contiguous blocks per program
+        # Select kernel variant via env
         def _get_int_env(name, default):
             try:
                 return int(os.environ.get(name, default))
             except Exception:
                 return default
 
-        group_blocks = _get_int_env('NF4_GROUP_BLOCKS', 8)  # 8 blocks = 512 outputs per program
-        group_blocks = max(1, min(group_blocks, blocks_per_row))
-
-        grid = (m, (blocks_per_row + group_blocks - 1) // group_blocks)
-        _nf4_dequantize_grouped[grid](
-            qweight.view(-1),
-            absmax.view(-1),
-            absmax32.view(-1),
-            lut_low,
-            lut_high,
-            output.view(-1),
-            m, n,
-            blocks_per_row,
-            absmax32_per_row,
-            group_blocks,
-            num_warps=warps,
-            num_stages=stages,
-        )
+        kernel_kind = os.environ.get('NF4_TRITON_KERNEL', 'pairs_loop')
+        if kernel_kind == 'grouped':
+            group_blocks = _get_int_env('NF4_GROUP_BLOCKS', 8)
+            group_blocks = max(1, min(group_blocks, blocks_per_row))
+            grid = (m, (blocks_per_row + group_blocks - 1) // group_blocks)
+            _nf4_dequantize_grouped[grid](
+                qweight.view(-1),
+                absmax.view(-1),
+                absmax32.view(-1),
+                lut_low,
+                lut_high,
+                output.view(-1),
+                m, n,
+                blocks_per_row,
+                absmax32_per_row,
+                group_blocks,
+                num_warps=warps,
+                num_stages=stages,
+            )
+        else:
+            blocks_per_pid = _get_int_env('NF4_BLOCKS_PER_PID', 8)
+            total_blocks = m * blocks_per_row
+            grid = ((total_blocks + blocks_per_pid - 1) // blocks_per_pid,)
+            _nf4_dequantize_pairs_loop[grid](
+                qweight.view(-1),
+                absmax.view(-1),
+                absmax32.view(-1),
+                lut_low,
+                lut_high,
+                output.view(-1),
+                m, n,
+                blocks_per_row,
+                absmax32_per_row,
+                blocks_per_pid,
+                num_warps=warps,
+                num_stages=stages,
+            )
 
         return output
         
