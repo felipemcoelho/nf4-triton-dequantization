@@ -187,6 +187,9 @@ def _nf4_dequantize_grouped(
         q_base = row_q_base + (col_start >> 1)
         o_base = row_o_base + col_start
 
+        tl.multiple_of(q_base, 16)
+        tl.multiple_of(o_base, 32)
+
         # Decode 32 packed bytes -> 64 outputs
         offsets = tl.arange(0, 32)
         packed = tl.load(qweight_ptr + q_base + offsets, cache_modifier=".ca")  # uint8
@@ -247,6 +250,10 @@ def _nf4_dequantize_pairs_loop(
     prev_grp4 = tl.full((), -1, tl.int32)
     cached_a32 = tl.full((), 0.0, tl.float32)
 
+    # Reuse common offsets across iterations to help scheduler
+    offsets = tl.arange(0, 32)
+    tl.multiple_of(offsets, 16)
+
     for b in tl.static_range(BLOCKS_PER_PID):
         blk = start_block + b
         if blk >= end_block:
@@ -275,8 +282,6 @@ def _nf4_dequantize_pairs_loop(
         q_base = row_q_base + (col_start >> 1)
         o_base = row_o_base + col_start
 
-        offsets = tl.arange(0, 32)
-        tl.multiple_of(offsets, 16)
         packed = tl.load(qweight_ptr + q_base + offsets, cache_modifier=".ca")
         low = packed & 0xF
         high = (packed >> 4) & 0xF
@@ -605,7 +610,7 @@ def triton_dequantize_nf4(module):
         stages = 2
 
         # Hardcoded kernel defaults optimized for T4 (no env required)
-        blocks_per_pid = 12
+        blocks_per_pid = 8
         warps = max(1, warps)
         stages = max(1, stages)
         total_blocks = m * blocks_per_row
