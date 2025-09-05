@@ -225,14 +225,12 @@ def _nf4_dequantize_grouped(
 @triton.jit
 def _nf4_dequantize_pairs_loop(
     qweight_ptr,           # pointer to uint8 qweight [m, n//2]
-    absmax_ptr,            # pointer to absmax scales
-    absmax32_ptr,          # pointer to absmax32 scales
+    scale_ptr,             # pointer to per-block combined scale [m, blocks]
     lut_low_ptr,           # pointer to 256-element LUT for low nibble (dtype)
     lut_high_ptr,          # pointer to 256-element LUT for high nibble (dtype)
     output_ptr,            # pointer to output [m, n] (dtype)
     m, n,
     blocks_per_row: tl.constexpr,
-    absmax32_per_row: tl.constexpr,
     BLOCKS_PER_PID: tl.constexpr,
 ):
     # 1D grid across all 64-wide blocks; each program processes BLOCKS_PER_PID blocks
@@ -243,12 +241,6 @@ def _nf4_dequantize_pairs_loop(
         return
 
     end_block = tl.minimum(start_block + BLOCKS_PER_PID, total_blocks)
-
-    # Iterate assigned blocks
-    # Hoist absmax32 loads: reuse within groups-of-4 when possible
-    prev_row = tl.full((), -1, tl.int32)
-    prev_grp4 = tl.full((), -1, tl.int32)
-    cached_a32 = tl.full((), 0.0, tl.float32)
 
     # Reuse common offsets across iterations to help scheduler
     offsets = tl.arange(0, 32)
@@ -263,18 +255,9 @@ def _nf4_dequantize_pairs_loop(
         block_in_row = blk % blocks_per_row
         col_start = block_in_row * 64
 
-        # Load scales and combine
-        absmax_idx = row * blocks_per_row + block_in_row
-        a8 = tl.load(absmax_ptr + absmax_idx, cache_modifier=".ca")
-
-        grp4 = block_in_row >> 2
-        # If row or grp4 changed, reload absmax32
-        if (row != prev_row) | (grp4 != prev_grp4):
-            absmax32_idx = row * absmax32_per_row + grp4
-            cached_a32 = tl.load(absmax32_ptr + absmax32_idx, cache_modifier=".ca").to(tl.float32)
-            prev_row = row
-            prev_grp4 = grp4
-        scale = a8.to(tl.float32) * 0.00787401574803149606 * cached_a32
+        # Load precomputed combined scale (dtype matches output dtype)
+        scale_idx = row * blocks_per_row + block_in_row
+        scale = tl.load(scale_ptr + scale_idx, cache_modifier=".ca")
 
         # Base addresses
         row_q_base = row * (n >> 1)
@@ -283,35 +266,13 @@ def _nf4_dequantize_pairs_loop(
         o_base = row_o_base + col_start
 
         packed = tl.load(qweight_ptr + q_base + offsets, cache_modifier=".ca")
-        low = packed & 0xF
-        high = (packed >> 4) & 0xF
+        # Use 256-entry LUTs passed in (low/high)
+        low_vals = tl.load(lut_low_ptr + packed, cache_modifier=".ca")
+        high_vals = tl.load(lut_high_ptr + packed, cache_modifier=".ca")
 
-        # Map nibbles to NF4 values using branchless select chain (no LUT loads)
-        # Constants are compile-time and will be kept in registers/const memory
-        def map_nf4(x):
-            x = x.to(tl.int32)
-            neg = tl.where(x == 0, -1.0,
-                  tl.where(x == 1, -0.6961928009986877,
-                  tl.where(x == 2, -0.5250730514526367,
-                  tl.where(x == 3, -0.39491748809814453,
-                  tl.where(x == 4, -0.28444138169288635,
-                  tl.where(x == 5, -0.18477343022823334,
-                  tl.where(x == 6, -0.09105003625154495, 0.0)))))))
-            pos = tl.where(x == 8, 0.07958029955625534,
-                  tl.where(x == 9, 0.16093020141124725,
-                  tl.where(x == 10, 0.24611230194568634,
-                  tl.where(x == 11, 0.33791524171829224,
-                  tl.where(x == 12, 0.44070982933044434,
-                  tl.where(x == 13, 0.5626170039176941,
-                  tl.where(x == 14, 0.7229568362236023, 1.0)))))))
-            return tl.where(x < 8, neg, pos)
-
-        compute_t = tl.float16
-        low_vals = map_nf4(low).to(compute_t)
-        high_vals = map_nf4(high).to(compute_t)
-
-        scale_t = scale.to(compute_t)
-        # Scale in half for throughput, then cast at store
+        # Scale in destination dtype directly
+        dtype_t = tl.dtype_of(low_vals)
+        scale_t = scale.to(dtype_t)
         low_scaled = low_vals * scale_t
         high_scaled = high_vals * scale_t
 
@@ -320,7 +281,7 @@ def _nf4_dequantize_pairs_loop(
         even_mask = (col_start + even_offs) < n
         odd_mask = (col_start + odd_offs) < n
 
-        # Cast to output dtype prior to store for bandwidth
+        # Store in output dtype
         dout = tl.dtype_of(output_ptr)
         tl.store(output_ptr + o_base + even_offs, low_scaled.to(dout), mask=even_mask, eviction_policy="evict_first")
         tl.store(output_ptr + o_base + odd_offs,  high_scaled.to(dout), mask=odd_mask, eviction_policy="evict_first")
@@ -576,6 +537,14 @@ def triton_dequantize_nf4(module):
         # Allocate output
         output = torch.empty((m, n), dtype=dtype, device=device)
 
+        # Precompute per-block combined scales in destination dtype to reduce kernel math
+        blocks_per_row = (n + 63) // 64
+        group_idx = torch.arange(blocks_per_row, device=device) // 4
+        # Ensure types: absmax is uint8 -> float; absmax32 is float32
+        absmax_f = absmax.to(torch.float32) * (1.0 / 127.0)
+        absmax32_g = absmax32.to(torch.float32)
+        scale_blocks = (absmax_f * absmax32_g[:, group_idx]).to(dtype).contiguous()
+
         # Build/reuse 256-LUTs on device for target dtype (cache on device+dtype)
         lut_key = (device, dtype)
         lut256 = _LUT256_CACHE.get(lut_key)
@@ -617,14 +586,12 @@ def triton_dequantize_nf4(module):
         grid = ((total_blocks + blocks_per_pid - 1) // blocks_per_pid,)
         _nf4_dequantize_pairs_loop[grid](
             qweight.view(-1),
-            absmax.view(-1),
-            absmax32.view(-1),
+            scale_blocks.view(-1),
             lut_low,
             lut_high,
             output.view(-1),
             m, n,
             blocks_per_row,
-            absmax32_per_row,
             blocks_per_pid,
             num_warps=4,
             num_stages=2,
