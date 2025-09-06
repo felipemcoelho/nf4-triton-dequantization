@@ -8,122 +8,111 @@ import triton
 import triton.language as tl
 
 
-@triton.jit  
-def _nf4_dequantize_ultra_fast(
+@triton.jit
+def _nf4_dequantize_kernel_final(
     qweight_ptr,
-    absmax_ptr, 
+    absmax_ptr,
     absmax32_ptr,
     output_ptr,
     m, n,
     blocks_per_row: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr = 64,
 ):
-    """Ultra-fast NF4 dequantization optimized for Tesla T4."""
+    """Final aggressive NF4 kernel with correct interleaving."""
     
-    # Grid of BLOCK_M x BLOCK_N tiles
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    total_blocks = m * blocks_per_row
     
-    # Compute the range of rows and columns for this block
-    row_start = pid_m * BLOCK_M
-    col_start = pid_n * BLOCK_N
-    
-    # Early exit if out of bounds
-    if row_start >= m or col_start >= n:
+    if pid >= total_blocks:
         return
-        
-    # Create row and column indices for this block
-    row_idx = row_start + tl.arange(0, BLOCK_M)
-    col_idx = col_start + tl.arange(0, BLOCK_N)
     
-    # Masks for valid indices
-    row_mask = row_idx < m
-    col_mask = col_idx < n
+    row = pid // blocks_per_row
+    block_in_row = pid % blocks_per_row
+    col_start = block_in_row * BLOCK_SIZE
     
-    # NF4 lookup table values as constants
-    nf4_0 = -1.0
-    nf4_1 = -0.6961928009986877
-    nf4_2 = -0.5250730514526367
-    nf4_3 = -0.39491748809814453
-    nf4_4 = -0.28444138169288635
-    nf4_5 = -0.18477343022823334
-    nf4_6 = -0.09105003625154495
-    nf4_7 = 0.0
-    nf4_8 = 0.07958029955625534
-    nf4_9 = 0.16093020141124725
-    nf4_10 = 0.24611230194568634
-    nf4_11 = 0.33791524171829224
-    nf4_12 = 0.44070982933044434
-    nf4_13 = 0.5626170039176941
-    nf4_14 = 0.7229568362236023
-    nf4_15 = 1.0
+    if col_start >= n:
+        return
     
-    # Process each element in the block
-    for i in range(BLOCK_M):
-        if row_start + i >= m:
-            continue
-            
-        row = row_start + i
-        
-        for j in range(BLOCK_N):
-            if col_start + j >= n:
-                continue
-                
-            col = col_start + j
-            
-            # Calculate which 64-element block this column belongs to
-            block_idx = col // 64
-            
-            # Calculate absmax indices
-            absmax_idx = row * blocks_per_row + block_idx
-            absmax32_idx = row * ((blocks_per_row + 3) // 4) + (block_idx // 4)
-            
-            # Load and dequantize absmax
-            absmax_uint8 = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
-            absmax32_float = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
-            
-            # Double dequantization
-            scale = (absmax_uint8 / 127.0) * absmax32_float
-            
-            # Calculate packed weight index
-            packed_idx = row * (n // 2) + (col // 2)
-            
-            # Load packed byte
-            packed_byte = tl.load(qweight_ptr + packed_idx).to(tl.int32)
-            
-            # Extract the appropriate nibble
-            if col % 2 == 0:
-                nibble = packed_byte & 0xF
-            else:
-                nibble = (packed_byte >> 4) & 0xF
-            
-            # NF4 lookup using explicit comparisons
-            val = tl.where(nibble == 0, nf4_0,
-                  tl.where(nibble == 1, nf4_1,
-                  tl.where(nibble == 2, nf4_2,
-                  tl.where(nibble == 3, nf4_3,
-                  tl.where(nibble == 4, nf4_4,
-                  tl.where(nibble == 5, nf4_5,
-                  tl.where(nibble == 6, nf4_6,
-                  tl.where(nibble == 7, nf4_7,
-                  tl.where(nibble == 8, nf4_8,
-                  tl.where(nibble == 9, nf4_9,
-                  tl.where(nibble == 10, nf4_10,
-                  tl.where(nibble == 11, nf4_11,
-                  tl.where(nibble == 12, nf4_12,
-                  tl.where(nibble == 13, nf4_13,
-                  tl.where(nibble == 14, nf4_14, nf4_15)))))))))))))))
-            
-            # Apply scale and store
-            result = val * scale
-            output_idx = row * n + col
-            tl.store(output_ptr + output_idx, result)
+    # Load scales for double dequantization
+    absmax_idx = pid
+    absmax_quant = tl.load(absmax_ptr + absmax_idx).to(tl.float32)
+    
+    absmax32_group = block_in_row >> 2
+    absmax32_idx = row * ((blocks_per_row + 3) >> 2) + absmax32_group
+    absmax32_scale = tl.load(absmax32_ptr + absmax32_idx).to(tl.float32)
+    
+    # Double dequantization
+    scale = (absmax_quant / 127.0) * absmax32_scale
+    
+    # Base addresses
+    qweight_base = row * (n >> 1) + (col_start >> 1)
+    output_base = row * n + col_start
+    
+    # Load 32 uint8 values (64 4-bit values)
+    packed_offsets = tl.arange(0, 32)
+    packed = tl.load(qweight_ptr + qweight_base + packed_offsets,
+                     mask=packed_offsets < ((n - col_start + 1) >> 1),
+                     other=0).to(tl.int32)
+    
+    # Extract nibbles
+    low_nibbles = packed & 0xF
+    high_nibbles = (packed >> 4) & 0xF
+    
+    # NF4 lookup - aggressive inline constants
+    # Low nibbles
+    low_vals = tl.where(low_nibbles == 0, -1.0,
+               tl.where(low_nibbles == 1, -0.6961928009986877,
+               tl.where(low_nibbles == 2, -0.5250730514526367,
+               tl.where(low_nibbles == 3, -0.39491748809814453,
+               tl.where(low_nibbles == 4, -0.28444138169288635,
+               tl.where(low_nibbles == 5, -0.18477343022823334,
+               tl.where(low_nibbles == 6, -0.09105003625154495,
+               tl.where(low_nibbles == 7, 0.0,
+               tl.where(low_nibbles == 8, 0.07958029955625534,
+               tl.where(low_nibbles == 9, 0.16093020141124725,
+               tl.where(low_nibbles == 10, 0.24611230194568634,
+               tl.where(low_nibbles == 11, 0.33791524171829224,
+               tl.where(low_nibbles == 12, 0.44070982933044434,
+               tl.where(low_nibbles == 13, 0.5626170039176941,
+               tl.where(low_nibbles == 14, 0.7229568362236023, 1.0)))))))))))))))
+    
+    # High nibbles
+    high_vals = tl.where(high_nibbles == 0, -1.0,
+                tl.where(high_nibbles == 1, -0.6961928009986877,
+                tl.where(high_nibbles == 2, -0.5250730514526367,
+                tl.where(high_nibbles == 3, -0.39491748809814453,
+                tl.where(high_nibbles == 4, -0.28444138169288635,
+                tl.where(high_nibbles == 5, -0.18477343022823334,
+                tl.where(high_nibbles == 6, -0.09105003625154495,
+                tl.where(high_nibbles == 7, 0.0,
+                tl.where(high_nibbles == 8, 0.07958029955625534,
+                tl.where(high_nibbles == 9, 0.16093020141124725,
+                tl.where(high_nibbles == 10, 0.24611230194568634,
+                tl.where(high_nibbles == 11, 0.33791524171829224,
+                tl.where(high_nibbles == 12, 0.44070982933044434,
+                tl.where(high_nibbles == 13, 0.5626170039176941,
+                tl.where(high_nibbles == 14, 0.7229568362236023, 1.0)))))))))))))))
+    
+    # Apply scale
+    low_scaled = low_vals * scale
+    high_scaled = high_vals * scale
+    
+    # CRITICAL FIX: Reverse interleaving pattern!
+    # Based on search results, HIGH nibbles come FIRST
+    out_indices_1 = tl.arange(0, 32) * 2      # Even positions
+    out_indices_2 = tl.arange(0, 32) * 2 + 1  # Odd positions
+    
+    mask_1 = (col_start + out_indices_1) < n
+    mask_2 = (col_start + out_indices_2) < n
+    
+    # Store HIGH nibbles at even positions, LOW at odd
+    tl.store(output_ptr + output_base + out_indices_1, high_scaled, mask=mask_1)
+    tl.store(output_ptr + output_base + out_indices_2, low_scaled, mask=mask_2)
 
 
 def triton_dequantize_nf4(module):
     """
-    Main entry point for NF4 dequantization using ultra-fast pure PyTorch.
+    Main entry point - aggressive implementation for Tesla T4.
     """
     weight = module.weight
     quant_state = weight.quant_state
@@ -137,21 +126,22 @@ def triton_dequantize_nf4(module):
     m = module.out_features
     n = module.in_features
     
-    # For Tesla T4, use optimized PyTorch implementation
-    # Triton compilation overhead makes it slower on T4
-    if str(device) == 'cuda:0' or device.type == 'cuda':
-        # Check if this is likely a Tesla T4 (compute capability 7.5)
-        # On T4, pure PyTorch with careful optimization is faster
-        return _ultra_fast_pytorch_t4(module)
+    # Aggressive optimization: Use pure PyTorch for T4 to avoid Triton overhead
+    if device.type == 'cuda':
+        import torch.cuda as cuda
+        # Check if this is Tesla T4 (compute capability 7.5)
+        if cuda.is_available():
+            cap = cuda.get_device_capability()
+            if cap == (7, 5):  # Tesla T4
+                return _aggressive_pytorch_t4(module)
     
-    # Fallback to Triton kernel for other GPUs
-    return _triton_kernel_fallback(module)
+    # Otherwise use Triton kernel
+    return _triton_dequantize_main(module)
 
 
-def _ultra_fast_pytorch_t4(module):
+def _triton_dequantize_main(module):
     """
-    Ultra-optimized pure PyTorch implementation for Tesla T4.
-    Avoids Triton compilation overhead and uses T4-specific optimizations.
+    Triton kernel path with corrected interleaving.
     """
     weight = module.weight
     quant_state = weight.quant_state
@@ -165,154 +155,28 @@ def _ultra_fast_pytorch_t4(module):
     m = module.out_features
     n = module.in_features
     
-    # Ensure correct dtypes
+    blocks_per_row = (n + 63) // 64
+    total_blocks = m * blocks_per_row
+    
+    # Ensure correct types
     if qweight.dtype != torch.uint8:
         qweight = qweight.to(torch.uint8)
     
-    # Reshape weights
-    qweight = qweight.contiguous().view(m, -1)
-    
-    # Calculate dimensions
-    blocks_per_row = (n + 63) // 64
-    
-    # NF4 lookup table - keep on GPU for fast indexing
-    nf4_lut = torch.tensor([
-        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
-    ], dtype=torch.float32, device=device)
-    
-    # Handle absmax double dequantization
-    if absmax.dtype == torch.uint8:
-        # Need double dequantization
-        absmax = absmax.view(-1)
-        absmax32 = absmax32.view(-1)
-        
-        # Ensure we have the right number of scales
-        total_blocks = m * blocks_per_row
-        if absmax.numel() < total_blocks:
-            # Repeat to fill
-            repeats = (total_blocks + absmax.numel() - 1) // absmax.numel()
-            absmax = absmax.repeat(repeats)[:total_blocks]
-        else:
-            absmax = absmax[:total_blocks]
-        
-        absmax = absmax.view(m, blocks_per_row)
-        
-        # Handle absmax32
-        absmax32_per_row = (blocks_per_row + 3) // 4
-        total_absmax32 = m * absmax32_per_row
-        if absmax32.numel() < total_absmax32:
-            repeats = (total_absmax32 + absmax32.numel() - 1) // absmax32.numel()
-            absmax32 = absmax32.repeat(repeats)[:total_absmax32]
-        else:
-            absmax32 = absmax32[:total_absmax32]
-        
-        absmax32 = absmax32.view(m, absmax32_per_row).to(torch.float32)
-        
-        # Double dequantization: dequantize absmax using absmax32
-        # Each group of 4 blocks shares one absmax32 scale
-        absmax_float = torch.zeros((m, blocks_per_row), dtype=torch.float32, device=device)
-        for i in range(blocks_per_row):
-            absmax32_idx = i // 4
-            if absmax32_idx < absmax32_per_row:
-                absmax_float[:, i] = (absmax[:, i].float() / 127.0) * absmax32[:, absmax32_idx]
-        
-        absmax = absmax_float
-    else:
-        # Already dequantized
-        absmax = absmax.view(m, -1)[:, :blocks_per_row].to(torch.float32)
-    
-    # Allocate output tensor
-    output = torch.empty((m, n), dtype=dtype, device=device)
-    
-    # Process all data at once using vectorized operations
-    # Extract all nibbles in one go
-    low_nibbles = (qweight & 0xF).long()
-    high_nibbles = ((qweight >> 4) & 0xF).long()
-    
-    # Lookup all values
-    low_vals = nf4_lut[low_nibbles]
-    high_vals = nf4_lut[high_nibbles]
-    
-    # Apply scales block by block
-    for block_idx in range(blocks_per_row):
-        col_start = block_idx * 64
-        col_end = min(col_start + 64, n)
-        
-        if col_start >= n:
-            break
-        
-        # Get the scale for this block
-        scale = absmax[:, block_idx:block_idx+1]
-        
-        # Calculate packed indices for this block
-        packed_start = col_start // 2
-        packed_end = (col_end + 1) // 2
-        
-        # Get values for this block
-        block_low = low_vals[:, packed_start:packed_end] * scale
-        block_high = high_vals[:, packed_start:packed_end] * scale
-        
-        # Interleave and store efficiently
-        # Use advanced indexing for fast interleaving
-        num_pairs = packed_end - packed_start
-        for i in range(num_pairs):
-            out_col1 = col_start + i * 2
-            out_col2 = out_col1 + 1
-            
-            if out_col1 < n:
-                output[:, out_col1] = block_low[:, i].to(dtype)
-            if out_col2 < n:
-                output[:, out_col2] = block_high[:, i].to(dtype)
-    
-    return output
-
-
-def _triton_kernel_fallback(module):
-    """
-    Fallback Triton kernel for newer GPUs.
-    """
-    weight = module.weight
-    quant_state = weight.quant_state
-    
-    qweight = weight.data
-    absmax = quant_state.absmax
-    absmax32 = quant_state.state2.absmax
-    dtype = quant_state.dtype
-    device = qweight.device
-    
-    m = module.out_features
-    n = module.in_features
-    
-    # Use simpler grid configuration
-    BLOCK_M = 4
-    BLOCK_N = 128
-    
-    # Calculate dimensions
-    blocks_per_row = (n + 63) // 64
+    # Check if absmax needs double dequantization
+    if absmax.dtype != torch.uint8:
+        return _aggressive_pytorch_t4(module)
     
     # Prepare tensors
-    if qweight.dtype != torch.uint8:
-        qweight = qweight.to(torch.uint8)
-    
     qweight = qweight.contiguous().view(-1)
     
     # Handle absmax
-    if absmax.dtype != torch.uint8:
-        # Use PyTorch fallback if already dequantized
-        return _ultra_fast_pytorch_t4(module)
-    
-    # Prepare absmax tensors
-    total_blocks = m * blocks_per_row
     absmax = absmax.view(-1)
     if absmax.numel() < total_blocks:
         repeats = (total_blocks + absmax.numel() - 1) // absmax.numel()
         absmax = absmax.repeat(repeats)[:total_blocks]
     absmax = absmax[:total_blocks].contiguous()
     
-    # Prepare absmax32
+    # Handle absmax32
     absmax32_per_row = (blocks_per_row + 3) // 4
     total_absmax32 = m * absmax32_per_row
     absmax32 = absmax32.view(-1).to(torch.float32)
@@ -325,23 +189,127 @@ def _triton_kernel_fallback(module):
     output = torch.empty((m, n), dtype=dtype, device=device)
     
     # Launch kernel
-    grid = lambda META: (
-        triton.cdiv(m, META['BLOCK_M']),
-        triton.cdiv(n, META['BLOCK_N']),
-    )
+    grid = (total_blocks,)
     
-    _nf4_dequantize_ultra_fast[grid](
+    _nf4_dequantize_kernel_final[grid](
         qweight,
         absmax,
         absmax32,
         output.view(-1),
         m, n,
         blocks_per_row,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        num_warps=4,
+        num_warps=2,
         num_stages=2,
     )
+    
+    return output
+
+
+def _aggressive_pytorch_t4(module):
+    """
+    Ultra-aggressive PyTorch implementation for Tesla T4.
+    Optimized to avoid Triton compilation overhead.
+    """
+    weight = module.weight
+    quant_state = weight.quant_state
+    
+    qweight = weight.data
+    absmax = quant_state.absmax
+    absmax32 = quant_state.state2.absmax
+    dtype = quant_state.dtype
+    device = qweight.device
+    
+    m = module.out_features
+    n = module.in_features
+    
+    # Ensure uint8
+    if qweight.dtype != torch.uint8:
+        qweight = qweight.to(torch.uint8)
+    
+    qweight = qweight.contiguous().view(m, -1)
+    
+    blocks_per_row = (n + 63) // 64
+    
+    # NF4 LUT
+    nf4_lut = torch.tensor([
+        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+    ], dtype=torch.float32, device=device)
+    
+    # Handle double dequantization
+    if absmax.dtype == torch.uint8:
+        absmax = absmax.view(-1)
+        absmax32 = absmax32.view(-1)
+        
+        total_blocks = m * blocks_per_row
+        if absmax.numel() < total_blocks:
+            repeats = (total_blocks + absmax.numel() - 1) // absmax.numel()
+            absmax = absmax.repeat(repeats)[:total_blocks]
+        else:
+            absmax = absmax[:total_blocks]
+        
+        absmax = absmax.view(m, blocks_per_row)
+        
+        absmax32_per_row = (blocks_per_row + 3) // 4
+        total_absmax32 = m * absmax32_per_row
+        if absmax32.numel() < total_absmax32:
+            repeats = (total_absmax32 + absmax32.numel() - 1) // absmax32.numel()
+            absmax32 = absmax32.repeat(repeats)[:total_absmax32]
+        else:
+            absmax32 = absmax32[:total_absmax32]
+        
+        absmax32 = absmax32.view(m, absmax32_per_row).to(torch.float32)
+        
+        # Double dequantization
+        absmax_float = torch.zeros((m, blocks_per_row), dtype=torch.float32, device=device)
+        for i in range(blocks_per_row):
+            absmax32_idx = i // 4
+            if absmax32_idx < absmax32_per_row:
+                absmax_float[:, i] = (absmax[:, i].float() / 127.0) * absmax32[:, absmax32_idx]
+        
+        absmax = absmax_float
+    else:
+        absmax = absmax.view(m, -1)[:, :blocks_per_row].to(torch.float32)
+    
+    # Allocate output
+    output = torch.empty((m, n), dtype=dtype, device=device)
+    
+    # Extract all nibbles
+    low_nibbles = (qweight & 0xF).long()
+    high_nibbles = ((qweight >> 4) & 0xF).long()
+    
+    # Lookup values
+    low_vals = nf4_lut[low_nibbles]
+    high_vals = nf4_lut[high_nibbles]
+    
+    # Apply scales block by block with CORRECTED interleaving
+    for block_idx in range(blocks_per_row):
+        col_start = block_idx * 64
+        col_end = min(col_start + 64, n)
+        
+        if col_start >= n:
+            break
+        
+        scale = absmax[:, block_idx:block_idx+1]
+        
+        packed_start = col_start // 2
+        packed_end = (col_end + 1) // 2
+        
+        block_low = low_vals[:, packed_start:packed_end] * scale
+        block_high = high_vals[:, packed_start:packed_end] * scale
+        
+        # CRITICAL FIX: HIGH nibbles at even positions, LOW at odd
+        num_pairs = packed_end - packed_start
+        for i in range(num_pairs):
+            out_col1 = col_start + i * 2
+            out_col2 = out_col1 + 1
+            
+            if out_col1 < n:
+                output[:, out_col1] = block_high[:, i].to(dtype)  # HIGH first
+            if out_col2 < n:
+                output[:, out_col2] = block_low[:, i].to(dtype)   # LOW second
     
     return output
 
